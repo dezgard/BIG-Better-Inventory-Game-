@@ -3,7 +3,7 @@
     <TargetFramework>net472</TargetFramework>
     <AssemblyName>OstranautsSmartHaulingFresh</AssemblyName>
     <RootNamespace>OstranautsSmartHaulingFresh</RootNamespace>
-    <Version>0.5.0</Version>
+    <Version>0.6.0</Version>
     <LangVersion>latest</LangVersion>
     <GameDir>G:\Steam\steamapps\common\Ostranauts</GameDir>
   </PropertyGroup>

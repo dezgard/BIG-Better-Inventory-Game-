@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.0
+
+- Raised hauling and build/install batch limits to 200.
+- Added a planned carry capacity check for hauling so the mod stops adding extra pickup jobs when inventory space is already reserved.
+- Added a planned stack budget check for build/install material fetching so a batch does not reserve more than a stack can hold.
+- Added dolly-aware construction fetching for dragged dollies that can fit bulky build materials.
+- Improved build-fetch logging with capacity skip counts.
+- Note: local wall stack-size data edits are not part of this code mod release.
+
 ## 0.5.0
 
 - Raised the hauling batch limit to 80 tasks per pass.

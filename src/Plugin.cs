@@ -8,7 +8,7 @@ using UnityEngine;
 
 namespace OstranautsSmartHaulingFresh
 {
-    [BepInPlugin("com.dezgard.ostranauts.simplehauling", "Ostranauts Simple Smart Hauling", "0.5.0")]
+    [BepInPlugin("com.dezgard.ostranauts.simplehauling", "Ostranauts Simple Smart Hauling", "0.6.0")]
     public sealed class Plugin : BaseUnityPlugin
     {
         internal static ManualLogSource Log { get; private set; }
@@ -134,6 +134,55 @@ namespace OstranautsSmartHaulingFresh
                 return false;
             }
         }
+
+        internal static bool IsDolly(CondOwner item)
+        {
+            if (item == null)
+                return false;
+
+            try
+            {
+                if (item.HasCond("IsDolly"))
+                    return true;
+            }
+            catch
+            {
+            }
+
+            var text = ((item.strNameFriendly ?? "") + " " + (item.strName ?? "") + " " + (item.strCODef ?? "")).ToLowerInvariant();
+            return text.Contains("dolly") || text.Contains("equipment truck");
+        }
+
+        internal static CondOwner GetDraggedDolly(CondOwner hauler)
+        {
+            var dragged = GetDragSlotItem(hauler);
+            return IsDolly(dragged) ? dragged : null;
+        }
+
+        internal static bool CanFitDraggedDolly(CondOwner hauler, CondOwner item)
+        {
+            var dolly = GetDraggedDolly(hauler);
+            if (dolly?.objContainer == null || item == null)
+                return false;
+
+            try
+            {
+                return dolly.objContainer.CanFit(item, bAuto: false, bSub: true);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        internal static int GetDraggedDollyBatchLimit(CondOwner hauler)
+        {
+            var dolly = GetDraggedDolly(hauler);
+            if (dolly == null)
+                return 0;
+
+            return 200;
+        }
     }
 
     internal static class BatchSafety
@@ -154,6 +203,29 @@ namespace OstranautsSmartHaulingFresh
                 return true;
 
             return false;
+        }
+
+        internal static bool ShouldUseVanillaBuildCarry(CondOwner hauler, CondOwner item, out string reason)
+        {
+            if (CanUseDraggedDollyForBuild(hauler, item))
+            {
+                reason = "dolly";
+                return false;
+            }
+
+            return ShouldUseVanillaCarry(hauler, item, out reason);
+        }
+
+        internal static bool CanUseDraggedDollyForBuild(CondOwner hauler, CondOwner item)
+        {
+            if (hauler == null || item == null)
+                return false;
+
+            if (!HasDragSlot(item))
+                return false;
+
+            return ItemDiagnostics.CanFitDraggedDolly(hauler, item)
+                && ItemDiagnostics.CanTrigger(hauler, item, "PickupItemStack");
         }
 
         internal static bool IsSafeBatchCarryItem(CondOwner item, out string reason)
@@ -249,7 +321,7 @@ namespace OstranautsSmartHaulingFresh
 
     internal static class SimpleHaulBatcher
     {
-        private const int HardSafetyLimit = 80;
+        private const int HardSafetyLimit = 200;
         private static readonly HashSet<string> CompactingHaulerIDs = new HashSet<string>();
 
         internal static void TryCompactVanillaHaulQueue(CondOwner hauler)
@@ -290,6 +362,9 @@ namespace OstranautsSmartHaulingFresh
                     return;
 
                 var chains = new List<HaulChain> { primary };
+                var carryBudget = new PlannedCarryBudget(hauler);
+                carryBudget.TryReserve(primary.Item);
+
                 for (var i = 1; i < HardSafetyLimit; i++)
                 {
                     var task = workManager.ClaimNextTask(hauler);
@@ -305,8 +380,14 @@ namespace OstranautsSmartHaulingFresh
                         continue;
                     }
 
-                    if (!TryBuildVanillaHaulChain(hauler, task, destinationShipID, out var chain))
+                    if (!TryBuildVanillaHaulChain(hauler, task, destinationShipID, carryBudget, out var chain, out var failReason))
                     {
+                        if (failReason == "capacity")
+                        {
+                            Plugin.Log.LogInfo("[SimpleHaulCapacityStop] hauler=" + SafeCO(hauler)
+                                + " item={" + ItemDiagnostics.DescribeCarryState(hauler, item) + "}");
+                        }
+
                         workManager.UnclaimTask(task);
                         break;
                     }
@@ -332,9 +413,10 @@ namespace OstranautsSmartHaulingFresh
             }
         }
 
-        private static bool TryBuildVanillaHaulChain(CondOwner hauler, Task2 task, string requiredDestinationShipID, out HaulChain chain)
+        private static bool TryBuildVanillaHaulChain(CondOwner hauler, Task2 task, string requiredDestinationShipID, PlannedCarryBudget carryBudget, out HaulChain chain, out string failReason)
         {
             chain = null;
+            failReason = "other";
             if (hauler == null || task == null || !IsHaulTask(task))
                 return false;
 
@@ -350,6 +432,12 @@ namespace OstranautsSmartHaulingFresh
                 Plugin.Log.LogInfo("[SimpleHaulSkipVanillaCarry] hauler=" + SafeCO(hauler)
                     + " reason=" + reason
                     + " item={" + ItemDiagnostics.DescribeCarryState(hauler, item) + "}");
+                return false;
+            }
+
+            if (carryBudget != null && !carryBudget.TryReserve(item))
+            {
+                failReason = "capacity";
                 return false;
             }
 
@@ -375,6 +463,7 @@ namespace OstranautsSmartHaulingFresh
             task.SetIA(drop);
 
             chain = new HaulChain(item, pickup, walk, drop);
+            failReason = "";
             return true;
         }
 
@@ -553,6 +642,77 @@ namespace OstranautsSmartHaulingFresh
             return true;
         }
 
+        private sealed class PlannedCarryBudget
+        {
+            private readonly HashSet<string> _stackKeys = new HashSet<string>();
+            private int _freeSlots;
+
+            internal PlannedCarryBudget(CondOwner hauler)
+            {
+                _freeSlots = CountFreeSlots(hauler);
+                if (_freeSlots <= 0)
+                    _freeSlots = 1;
+            }
+
+            internal bool TryReserve(CondOwner item)
+            {
+                if (item == null)
+                    return false;
+
+                if (item.nStackLimit > 1)
+                {
+                    var key = StackKey(item);
+                    if (_stackKeys.Contains(key))
+                        return true;
+
+                    if (_freeSlots <= 0)
+                        return false;
+
+                    _stackKeys.Add(key);
+                    _freeSlots--;
+                    return true;
+                }
+
+                if (_freeSlots <= 0)
+                    return false;
+
+                _freeSlots--;
+                return true;
+            }
+
+            private static int CountFreeSlots(CondOwner hauler)
+            {
+                if (hauler?.compSlots == null)
+                    return 0;
+
+                try
+                {
+                    var count = 0;
+                    foreach (var slot in hauler.compSlots.GetSlotsHeldFirst(bDeep: true))
+                    {
+                        if (slot != null && slot.GetOutermostCO() == null)
+                            count++;
+                    }
+
+                    return count;
+                }
+                catch
+                {
+                    return 0;
+                }
+            }
+
+            private static string StackKey(CondOwner item)
+            {
+                return item.strCODef
+                    ?? item.strItemDef
+                    ?? item.strName
+                    ?? item.strNameFriendly
+                    ?? item.strID
+                    ?? "";
+            }
+        }
+
         private sealed class HaulChain
         {
             internal HaulChain(CondOwner item, Interaction pickup, Interaction walk, Interaction drop)
@@ -572,7 +732,7 @@ namespace OstranautsSmartHaulingFresh
 
     internal static class BuildMaterialFetchBatcher
     {
-        private const int FetchSafetyLimit = 80;
+        private const int FetchSafetyLimit = 200;
         private static readonly HashSet<string> BatchingHaulerIDs = new HashSet<string>();
 
         internal static void TryBatchQueuedMaterialFetches(CondOwner hauler, Interaction insertedInteraction, bool insertedAtFront)
@@ -617,7 +777,7 @@ namespace OstranautsSmartHaulingFresh
                     + " material=" + requiredMaterial.strName
                     + " item={" + ItemDiagnostics.DescribeCarryState(hauler, insertedInteraction.objThem) + "}");
 
-                if (BatchSafety.ShouldUseVanillaCarry(hauler, insertedInteraction.objThem, out var primaryReason))
+                if (BatchSafety.ShouldUseVanillaBuildCarry(hauler, insertedInteraction.objThem, out var primaryReason))
                 {
                     Plugin.Log.LogInfo("[BuildFetchVanillaCarry] hauler=" + SafeCO(hauler)
                         + " build=" + buildInteraction.strName
@@ -732,19 +892,34 @@ namespace OstranautsSmartHaulingFresh
             if (candidates == null || candidates.Count == 0)
                 return extras;
 
+            var effectiveLimit = FetchSafetyLimit;
+            var dollyLimit = 0;
+            if (BatchSafety.CanUseDraggedDollyForBuild(hauler, alreadyQueued))
+            {
+                dollyLimit = ItemDiagnostics.GetDraggedDollyBatchLimit(hauler);
+                effectiveLimit = Math.Max(0, dollyLimit - 1);
+            }
+
+            if (effectiveLimit <= 0)
+                return extras;
+
             candidates.Sort((a, b) => DistanceSq(hauler, a).CompareTo(DistanceSq(hauler, b)));
             var seen = new HashSet<string>();
             if (!string.IsNullOrEmpty(alreadyQueued?.strID))
                 seen.Add(alreadyQueued.strID);
 
+            var carryBudget = new PlannedMaterialBudget();
+            carryBudget.TryReserve(alreadyQueued);
+
             var skippedNoFit = 0;
             var skippedNoPickup = 0;
             var skippedDragOnly = 0;
             var skippedVanillaCarry = 0;
+            var skippedCapacity = 0;
             var skippedOther = 0;
             foreach (var item in candidates)
             {
-                if (extras.Count >= FetchSafetyLimit)
+                if (extras.Count >= effectiveLimit)
                     break;
 
                 if (!IsCandidateBuildMaterial(hauler, item, requiredMaterial, seen, out var skipReason))
@@ -757,8 +932,16 @@ namespace OstranautsSmartHaulingFresh
                         skippedDragOnly++;
                     else if (skipReason == "vanillacarry")
                         skippedVanillaCarry++;
+                    else if (skipReason == "capacity")
+                        skippedCapacity++;
                     else
                         skippedOther++;
+                    continue;
+                }
+
+                if (!carryBudget.TryReserve(item))
+                {
+                    skippedCapacity++;
                     continue;
                 }
 
@@ -770,10 +953,13 @@ namespace OstranautsSmartHaulingFresh
                 + " material=" + requiredMaterial.strName
                 + " candidates=" + candidates.Count
                 + " selected=" + extras.Count
+                + " limit=" + effectiveLimit
+                + " dollyLimit=" + dollyLimit
                 + " skippedNoFit=" + skippedNoFit
                 + " skippedNoPickup=" + skippedNoPickup
                 + " skippedDragOnly=" + skippedDragOnly
                 + " skippedVanillaCarry=" + skippedVanillaCarry
+                + " skippedCapacity=" + skippedCapacity
                 + " skippedOther=" + skippedOther
                 + " firstSelected={" + DescribeSelectedItems(hauler, extras, 6) + "}");
 
@@ -810,7 +996,7 @@ namespace OstranautsSmartHaulingFresh
                 return false;
             }
 
-            if (BatchSafety.ShouldUseVanillaCarry(hauler, item, out _))
+            if (BatchSafety.ShouldUseVanillaBuildCarry(hauler, item, out _))
             {
                 skipReason = "vanillacarry";
                 return false;
@@ -871,6 +1057,9 @@ namespace OstranautsSmartHaulingFresh
 
             try
             {
+                if (ItemDiagnostics.CanFitDraggedDolly(hauler, item))
+                    return true;
+
                 if (hauler.objContainer != null && hauler.objContainer.CanFit(item, bAuto: false, bSub: true))
                     return true;
 
@@ -911,6 +1100,39 @@ namespace OstranautsSmartHaulingFresh
                     + " item=" + SafeCO(item)
                     + " error=" + ex.GetType().Name);
                 return false;
+            }
+        }
+
+        private sealed class PlannedMaterialBudget
+        {
+            private readonly Dictionary<string, int> _stackCounts = new Dictionary<string, int>();
+
+            internal bool TryReserve(CondOwner item)
+            {
+                if (item == null)
+                    return false;
+
+                if (item.nStackLimit <= 1)
+                    return true;
+
+                var key = StackKey(item);
+                _stackCounts.TryGetValue(key, out var count);
+                var newCount = count + Math.Max(1, item.StackCount);
+                if (newCount > item.nStackLimit)
+                    return false;
+
+                _stackCounts[key] = newCount;
+                return true;
+            }
+
+            private static string StackKey(CondOwner item)
+            {
+                return item.strCODef
+                    ?? item.strItemDef
+                    ?? item.strName
+                    ?? item.strNameFriendly
+                    ?? item.strID
+                    ?? "";
             }
         }
 

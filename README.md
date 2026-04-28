@@ -10,6 +10,8 @@ Drag-style and bulky items are intentionally left to the base game. That means c
 
 For building and installing, the mod also lets crew grab extra matching loose materials before feeding the first construction job. This reduces repeated trips when placing compatible stackable materials such as floors.
 
+The latest version also adds a stronger inventory capacity check. Crew should stop adding extra pickup jobs once their current carry plan is full, unload what they have, then continue on later work passes instead of trying to grab items that no longer fit.
+
 ## Features
 
 - Uses the game's normal haul marking and work system.
@@ -19,8 +21,9 @@ For building and installing, the mod also lets crew grab extra matching loose ma
 - Supports mixed safe inventory items going to the same ship.
 - Keeps each item's own vanilla drop action, so storage zones can still choose their own drop tiles.
 - Adds build/install material fetching for compatible loose materials.
-- Hauling batch limit: 80 tasks per pass.
-- Building material fetch limit: 80 extra items per pass.
+- Adds basic dolly-aware construction fetching when a dragged dolly can hold the material.
+- Hauling batch limit: 200 tasks per pass, still limited by inventory capacity.
+- Building material fetch limit: 200 extra items per pass, still limited by stack/carry checks.
 
 ## Requirements
 
