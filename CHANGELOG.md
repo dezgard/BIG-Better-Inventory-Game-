@@ -2,23 +2,15 @@
 
 ## 0.8.5
 
-- Switched the release to the V2 hauling plugin.
-- Replaced the old single-backpack planner.
-- Added real multi-container planning.
-- Counts backpack storage.
-- Counts hand-held containers.
-- Counts carried containers.
-- Counts dragged container storage.
-- Can use a marked crate as helper storage.
-- Can use a marked dolly as helper storage.
-- Keeps collecting loose items after grabbing a helper container.
-- Sorts loose pickups with path-aware ordering.
-- Stops planning when storage is full.
-- Keeps vanilla haul icons.
-- Keeps vanilla pickup actions.
-- Keeps vanilla drop actions.
-- Keeps vanilla task cleanup.
-- Released DLL is now `OstranautsHaulingV2.dll`.
+- Rebuilt the public release around the newer V2 hauling planner.
+- Replaced the old backpack-only capacity check with full carried-container planning.
+- Fixed planning so marked crates and dollies can be used as helper storage.
+- Fixed helper-container runs so loose pickup planning continues after the container is grabbed.
+- Improved loose pickup ordering with path-aware sorting.
+- Improved full-inventory handling by stopping the batch when planned storage is full.
+- Kept the vanilla haul lifecycle in control of icons, pickup actions, drop actions, and task cleanup.
+- Changed the release DLL name to `OstranautsHaulingV2.dll`.
+- Install note: remove old `OstranautsSmartHaulingFresh.dll` copies before installing this version.
 
 ## 0.7.0
 
