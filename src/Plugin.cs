@@ -4,11 +4,11 @@ using System.Text;
 using BepInEx;
 using BepInEx.Logging;
 using HarmonyLib;
-using UnityEngine;
+using Ostranauts.Inventory;
 
-namespace OstranautsSmartHaulingFresh
+namespace OstranautsHaulingV2
 {
-    [BepInPlugin("com.dezgard.ostranauts.simplehauling", "Ostranauts Simple Smart Hauling", "0.6.0")]
+    [BepInPlugin("com.dezgard.ostranauts.haulingv2", "Ostranauts Hauling V2", "0.8.5")]
     public sealed class Plugin : BaseUnityPlugin
     {
         internal static ManualLogSource Log { get; private set; }
@@ -17,9 +17,9 @@ namespace OstranautsSmartHaulingFresh
         private void Awake()
         {
             Log = Logger;
-            _harmony = new Harmony("com.dezgard.ostranauts.simplehauling");
+            _harmony = new Harmony("com.dezgard.ostranauts.haulingv2");
             _harmony.PatchAll();
-            Log.LogInfo("Ostranauts Simple Smart Hauling loaded. Vanilla haul queues are compacted, and build material fetches are batched.");
+            Log.LogInfo("Ostranauts Hauling V2 0.8.5 loaded. Utility dragged-container planning continues loose pickup.");
         }
 
         private void OnDestroy()
@@ -28,43 +28,675 @@ namespace OstranautsSmartHaulingFresh
         }
     }
 
-    internal static class ItemDiagnostics
+    internal static class VanillaHaulBatcher
     {
-        internal static string DescribeCarryState(CondOwner hauler, CondOwner item)
-        {
-            if (item == null)
-                return "<null>";
+        private const int HardSafetyLimit = 200;
+        private static readonly HashSet<string> CompactingHaulerIDs = new HashSet<string>();
+        private static readonly System.Reflection.MethodInfo GetPathToWalkableOriginMethod = AccessTools.Method(typeof(Pathfinder), "GetPathToWalkableOrigin", new[] { typeof(Tile), typeof(Tile) });
 
-            return SafeCO(item)
-                + " parent=" + SafeCO(item.objCOParent)
-                + " slot=" + (item.slotNow?.strName ?? "<none>")
-                + " stack=" + item.StackCount
-                + "/" + item.nStackLimit
-                + " carried=" + item.HasCond("IsCarried")
-                + " installed=" + item.HasCond("IsInstalled")
-                + " draggingHauler=" + (hauler?.HasCond("IsDragging") ?? false)
-                + " dragSlotItem=" + SafeCO(GetDragSlotItem(hauler))
-                + " itemSlots=" + DescribeItemSlots(item)
-                + " fits=" + CanFitInventory(hauler, item)
-                + " pickupStack=" + CanTrigger(hauler, item, "PickupItemStack")
-                + " dragStart=" + CanTrigger(hauler, item, "PickupDragStart");
+        internal static void TryCompact(CondOwner hauler)
+        {
+            if (hauler?.aQueue == null || hauler.aQueue.Count < 3 || string.IsNullOrEmpty(hauler.strID))
+                return;
+
+            HaulBatchRegistry.CleanupHauler(hauler);
+
+            lock (CompactingHaulerIDs)
+            {
+                if (CompactingHaulerIDs.Contains(hauler.strID))
+                    return;
+
+                CompactingHaulerIDs.Add(hauler.strID);
+            }
+
+            var skippedTasks = new List<Task2>();
+
+            try
+            {
+                if (!TryReadHaulChain(hauler.aQueue, 0, out var primary))
+                    return;
+
+                if (!CarriedContainerPlan.TryCreate(hauler, out var carryPlan, out var planReason))
+                {
+                    Plugin.Log.LogInfo("[V2HaulNoCarryPlan] hauler=" + SafeCO(hauler)
+                        + " reason=" + planReason
+                        + " item={" + DescribeItem(primary.Item) + "}");
+                    return;
+                }
+
+                var workManager = CrewSim.objInstance?.workManager;
+                if (workManager == null)
+                    return;
+
+                var destinationShipID = GetDestinationShipID(primary);
+                if (string.IsNullOrEmpty(destinationShipID))
+                    return;
+
+                var looseChains = new List<HaulChain>();
+                HaulChain utilityDragChain = null;
+                HaulChain dragChain = null;
+                var allowExtraDrag = !carryPlan.DragSlotOccupied;
+                var allowUtilityDrag = !carryPlan.DragSlotOccupied;
+                var seenItemIDs = new HashSet<string>();
+                if (!string.IsNullOrEmpty(primary.Item?.strID))
+                    seenItemIDs.Add(primary.Item.strID);
+
+                var inventoryClosed = false;
+                if (TryClassifyPrimary(hauler, primary, carryPlan, looseChains, ref utilityDragChain, ref dragChain, allowExtraDrag, allowUtilityDrag, out var primaryStopReason))
+                    inventoryClosed = primaryStopReason == "inventory-full";
+                else
+                    return;
+
+                for (var i = 1; i < HardSafetyLimit; i++)
+                {
+                    var task = workManager.ClaimNextTask(hauler);
+                    if (task == null)
+                        break;
+
+                    if (!TryReadClaimedHaulTask(hauler, task, out var item, out var tile, out var readReason))
+                    {
+                        workManager.UnclaimTask(task);
+                        Plugin.Log.LogInfo("[V2HaulClaimStop] hauler=" + SafeCO(hauler)
+                            + " reason=" + readReason);
+                        break;
+                    }
+
+                    if (!string.IsNullOrEmpty(item?.strID) && seenItemIDs.Contains(item.strID))
+                    {
+                        skippedTasks.Add(task);
+                        continue;
+                    }
+
+                    if (!string.Equals(task.strTileShip, destinationShipID, StringComparison.OrdinalIgnoreCase))
+                    {
+                        skippedTasks.Add(task);
+                        continue;
+                    }
+
+                    if (!IsLooseInventoryPickup(hauler, item, out var itemReason))
+                    {
+                        if (allowUtilityDrag && utilityDragChain == null && TryPlanUtilityDragContainer(hauler, task, item, tile, carryPlan, out utilityDragChain, out var utilityReason))
+                        {
+                            Plugin.Log.LogInfo("[V2UtilityDragAdded] hauler=" + SafeCO(hauler)
+                                + " reason=" + utilityReason
+                                + " item={" + DescribeItem(item) + "}");
+                            if (!string.IsNullOrEmpty(item.strID))
+                                seenItemIDs.Add(item.strID);
+                            continue;
+                        }
+
+                        if (allowExtraDrag && utilityDragChain == null && dragChain == null && IsOneTripDragCandidate(hauler, item, out var dragReason))
+                        {
+                            if (!TryQueueVanillaHaulChain(hauler, task, item, tile, out dragChain, out var dragQueueReason))
+                            {
+                                workManager.UnclaimTask(task);
+                                Plugin.Log.LogInfo("[V2HaulDragQueueStop] hauler=" + SafeCO(hauler)
+                                    + " reason=" + dragQueueReason
+                                    + " item={" + DescribeItem(item) + "}");
+                                break;
+                            }
+
+                            Plugin.Log.LogInfo("[V2HaulDragAdded] hauler=" + SafeCO(hauler)
+                                + " reason=" + dragReason
+                                + " item={" + DescribeItem(item) + "}");
+                            if (inventoryClosed)
+                                break;
+                        }
+                        else
+                        {
+                            skippedTasks.Add(task);
+                            Plugin.Log.LogInfo("[V2HaulSkipForLater] hauler=" + SafeCO(hauler)
+                                + " reason=" + itemReason
+                                + " item={" + DescribeItem(item) + "}");
+                        }
+                        continue;
+                    }
+
+                    if (inventoryClosed)
+                    {
+                        if (allowUtilityDrag && utilityDragChain == null && TryPlanUtilityDragContainer(hauler, task, item, tile, carryPlan, out utilityDragChain, out var fullUtilityReason))
+                        {
+                            inventoryClosed = false;
+                            Plugin.Log.LogInfo("[V2UtilityDragAdded] hauler=" + SafeCO(hauler)
+                                + " reason=" + fullUtilityReason + "/after-capacity"
+                                + " item={" + DescribeItem(item) + "}");
+                            if (!string.IsNullOrEmpty(item.strID))
+                                seenItemIDs.Add(item.strID);
+                            continue;
+                        }
+
+                        if (allowExtraDrag && utilityDragChain == null && dragChain == null && IsOneTripDragCandidate(hauler, item, out var fullDragReason))
+                        {
+                            if (!TryQueueVanillaHaulChain(hauler, task, item, tile, out dragChain, out var fullDragQueueReason))
+                            {
+                                workManager.UnclaimTask(task);
+                                Plugin.Log.LogInfo("[V2HaulDragQueueStop] hauler=" + SafeCO(hauler)
+                                    + " reason=" + fullDragQueueReason
+                                    + " item={" + DescribeItem(item) + "}");
+                                break;
+                            }
+
+                            Plugin.Log.LogInfo("[V2HaulDragAdded] hauler=" + SafeCO(hauler)
+                                + " reason=" + fullDragReason
+                                + " item={" + DescribeItem(item) + "}");
+                            break;
+                        }
+
+                        skippedTasks.Add(task);
+                        continue;
+                    }
+
+                    if (!carryPlan.TryReserve(item, out var reserveReason))
+                    {
+                        if (allowUtilityDrag && utilityDragChain == null && IsDragReserveStop(reserveReason) && TryPlanUtilityDragContainer(hauler, task, item, tile, carryPlan, out utilityDragChain, out var reserveUtilityReason))
+                        {
+                            Plugin.Log.LogInfo("[V2UtilityDragAdded] hauler=" + SafeCO(hauler)
+                                + " reason=" + reserveUtilityReason + "/" + reserveReason
+                                + " item={" + DescribeItem(item) + "}");
+                            if (!string.IsNullOrEmpty(item.strID))
+                                seenItemIDs.Add(item.strID);
+                            continue;
+                        }
+
+                        if (allowExtraDrag && utilityDragChain == null && IsDragReserveStop(reserveReason) && dragChain == null && IsOneTripDragCandidate(hauler, item, out var reserveDragReason))
+                        {
+                            if (!TryQueueVanillaHaulChain(hauler, task, item, tile, out dragChain, out var dragQueueReason))
+                            {
+                                workManager.UnclaimTask(task);
+                                Plugin.Log.LogInfo("[V2HaulDragQueueStop] hauler=" + SafeCO(hauler)
+                                    + " reason=" + dragQueueReason
+                                    + " item={" + DescribeItem(item) + "}");
+                                break;
+                            }
+
+                            Plugin.Log.LogInfo("[V2HaulDragAdded] hauler=" + SafeCO(hauler)
+                                + " reason=" + reserveDragReason + "/" + reserveReason
+                                + " item={" + DescribeItem(item) + "}");
+                            continue;
+                        }
+
+                        if (reserveReason == "no-grid-room")
+                        {
+                            inventoryClosed = true;
+                            workManager.UnclaimTask(task);
+                            Plugin.Log.LogInfo("[V2HaulCapacityStop] hauler=" + SafeCO(hauler)
+                                + " reason=" + reserveReason
+                                + " plannedItems=" + looseChains.Count
+                                + " dragAdded=" + (dragChain != null)
+                                + " carry={" + carryPlan.Description + "}"
+                                + " item={" + DescribeItem(item) + "}");
+                            if (dragChain != null)
+                                break;
+
+                            continue;
+                        }
+
+                        skippedTasks.Add(task);
+                        continue;
+                    }
+
+                    if (!TryQueueVanillaHaulChain(hauler, task, item, tile, out var chain, out var queueReason))
+                    {
+                        workManager.UnclaimTask(task);
+                        Plugin.Log.LogInfo("[V2HaulQueueStop] hauler=" + SafeCO(hauler)
+                            + " reason=" + queueReason
+                            + " item={" + DescribeItem(item) + "}");
+                        break;
+                    }
+
+                    looseChains.Add(chain);
+                    if (!string.IsNullOrEmpty(item.strID))
+                        seenItemIDs.Add(item.strID);
+                }
+
+                foreach (var skipped in skippedTasks)
+                    workManager.UnclaimTask(skipped);
+
+                skippedTasks.Clear();
+
+                SortPickupChainsNearestNeighbor(hauler, looseChains);
+
+                var chains = new List<HaulChain>(looseChains);
+                if (utilityDragChain == null && dragChain != null)
+                    chains.Add(dragChain);
+
+                if (chains.Count <= 1 && utilityDragChain == null)
+                    return;
+
+                CompactLeadingHaulChains(hauler, utilityDragChain, chains);
+
+                var registryChains = new List<HaulChain>(chains);
+                if (utilityDragChain != null)
+                    registryChains.Add(utilityDragChain);
+
+                HaulBatchRegistry.Register(hauler, registryChains);
+
+                Plugin.Log.LogInfo("[V2HaulCompacted] hauler=" + SafeCO(hauler)
+                    + " items=" + chains.Count
+                    + " loose=" + looseChains.Count
+                    + " drag=" + (utilityDragChain == null && dragChain != null)
+                    + " utilityDrag=" + (utilityDragChain != null)
+                    + " destinationShip=" + destinationShipID
+                    + " carry={" + carryPlan.Description + "}"
+                    + " queue={" + QueueSummary(hauler) + "}");
+            }
+            finally
+            {
+                var workManager = CrewSim.objInstance?.workManager;
+                if (workManager != null)
+                {
+                    foreach (var skipped in skippedTasks)
+                        workManager.UnclaimTask(skipped);
+                }
+
+                lock (CompactingHaulerIDs)
+                {
+                    CompactingHaulerIDs.Remove(hauler.strID);
+                }
+            }
         }
 
-        internal static string SafeCO(CondOwner co)
+        private static bool TryClassifyPrimary(CondOwner hauler, HaulChain primary, CarriedContainerPlan carryPlan, List<HaulChain> looseChains, ref HaulChain utilityDragChain, ref HaulChain dragChain, bool allowExtraDrag, bool allowUtilityDrag, out string stopReason)
         {
-            if (co == null)
-                return "<null>";
+            stopReason = "";
+            if (primary?.Item == null)
+                return false;
 
-            var name = string.IsNullOrEmpty(co.strNameFriendly) ? co.strName : co.strNameFriendly;
-            return (co.strID ?? "?") + "/" + (name ?? "?");
+            if (!IsLooseInventoryPickup(hauler, primary.Item, out var primaryReason))
+            {
+                if (allowUtilityDrag && utilityDragChain == null && TryPlanPrimaryUtilityDragContainer(hauler, primary, carryPlan, out utilityDragChain, out var utilityReason))
+                {
+                    Plugin.Log.LogInfo("[V2UtilityDragAdded] hauler=" + SafeCO(hauler)
+                        + " reason=" + utilityReason + "/primary-" + primaryReason
+                        + " item={" + DescribeItem(primary.Item) + "}");
+                    return true;
+                }
+
+                if (allowExtraDrag && utilityDragChain == null && dragChain == null && IsOneTripDragCandidate(hauler, primary.Item, out var dragReason))
+                {
+                    dragChain = primary;
+                    Plugin.Log.LogInfo("[V2HaulPrimaryDrag] hauler=" + SafeCO(hauler)
+                        + " reason=" + dragReason
+                        + " item={" + DescribeItem(primary.Item) + "}");
+                    return true;
+                }
+
+                Plugin.Log.LogInfo("[V2HaulVanillaPrimary] hauler=" + SafeCO(hauler)
+                    + " reason=" + primaryReason
+                    + " item={" + DescribeItem(primary.Item) + "}");
+                return false;
+            }
+
+            if (carryPlan.TryReserve(primary.Item, out var primaryReserveReason))
+            {
+                looseChains.Add(primary);
+                return true;
+            }
+
+            if (allowUtilityDrag && utilityDragChain == null && IsDragReserveStop(primaryReserveReason) && TryPlanPrimaryUtilityDragContainer(hauler, primary, carryPlan, out utilityDragChain, out var reserveUtilityReason))
+            {
+                Plugin.Log.LogInfo("[V2UtilityDragAdded] hauler=" + SafeCO(hauler)
+                    + " reason=" + reserveUtilityReason + "/primary-" + primaryReserveReason
+                    + " item={" + DescribeItem(primary.Item) + "}");
+                return true;
+            }
+
+            if (allowExtraDrag && utilityDragChain == null && IsDragReserveStop(primaryReserveReason) && dragChain == null && IsOneTripDragCandidate(hauler, primary.Item, out var reserveDragReason))
+            {
+                dragChain = primary;
+                Plugin.Log.LogInfo("[V2HaulPrimaryDrag] hauler=" + SafeCO(hauler)
+                    + " reason=" + reserveDragReason + "/" + primaryReserveReason
+                    + " item={" + DescribeItem(primary.Item) + "}");
+                return true;
+            }
+
+            Plugin.Log.LogInfo("[V2HaulPrimaryNoRoom] hauler=" + SafeCO(hauler)
+                + " reason=" + primaryReserveReason
+                + " carry={" + carryPlan.Description + "}"
+                + " item={" + DescribeItem(primary.Item) + "}");
+            stopReason = primaryReserveReason;
+            return false;
+        }
+
+        private static bool TryPlanPrimaryUtilityDragContainer(CondOwner hauler, HaulChain primary, CarriedContainerPlan carryPlan, out HaulChain chain, out string reason)
+        {
+            chain = null;
+            reason = "other";
+
+            if (primary?.Item == null)
+            {
+                reason = "null";
+                return false;
+            }
+
+            if (!IsUtilityDragContainerCandidate(hauler, primary.Item, out reason))
+                return false;
+
+            if (!carryPlan.TryAddPlannedContainer(primary.Item, "planned-primary-drag", out var addReason))
+            {
+                reason = "container-plan-" + addReason;
+                return false;
+            }
+
+            chain = primary;
+            reason = "planned-primary-drag-container";
+            return true;
+        }
+
+        private static bool TryReadClaimedHaulTask(CondOwner hauler, Task2 task, out CondOwner item, out Tile tile, out string reason)
+        {
+            item = null;
+            tile = null;
+            reason = "other";
+
+            if (hauler == null || task == null)
+            {
+                reason = "null";
+                return false;
+            }
+
+            if (!IsHaulTask(task))
+            {
+                reason = "not-haul-task";
+                return false;
+            }
+
+            item = task.GetIA()?.objThem;
+            if (item == null)
+            {
+                reason = "no-item";
+                return false;
+            }
+
+            if (!WorkManager.CTHaul.Triggered(item))
+            {
+                reason = "not-haulable";
+                return false;
+            }
+
+            tile = ResolveHaulDestination(hauler, task, item);
+            if (tile?.coProps == null || string.IsNullOrEmpty(task.strTileShip))
+            {
+                reason = "no-destination";
+                return false;
+            }
+
+            reason = "";
+            return true;
+        }
+
+        private static bool TryQueueVanillaHaulChain(CondOwner hauler, Task2 task, CondOwner item, Tile tile, out HaulChain chain, out string reason)
+        {
+            chain = null;
+            reason = "other";
+
+            var pickup = DataHandler.GetInteraction("PickupItemStack");
+            var walk = DataHandler.GetInteraction("Walk");
+            var drop = DataHandler.GetInteraction("DropItemStack");
+            if (pickup == null || walk == null || drop == null)
+            {
+                reason = "missing-interaction";
+                return false;
+            }
+
+            if (!hauler.QueueInteraction(item, pickup))
+            {
+                reason = "pickup-queue-failed";
+                return false;
+            }
+
+            task.strInteraction = pickup.strName;
+
+            walk.strTargetPoint = "use";
+            walk.fTargetPointRange = 0f;
+            if (!hauler.QueueInteraction(tile.coProps, walk))
+            {
+                reason = "walk-queue-failed";
+                return false;
+            }
+
+            if (!hauler.QueueInteraction(item, drop))
+            {
+                reason = "drop-queue-failed";
+                return false;
+            }
+
+            task.SetIA(drop);
+            chain = new HaulChain(item, pickup, walk, drop);
+            reason = "";
+            return true;
+        }
+
+        private static bool TryPlanUtilityDragContainer(CondOwner hauler, Task2 task, CondOwner item, Tile tile, CarriedContainerPlan carryPlan, out HaulChain chain, out string reason)
+        {
+            chain = null;
+            reason = "other";
+
+            if (!IsUtilityDragContainerCandidate(hauler, item, out reason))
+                return false;
+
+            var queueCount = hauler?.aQueue?.Count ?? 0;
+            if (!TryQueueUtilityDragChain(hauler, task, item, tile, out chain, out var queueReason))
+            {
+                RemoveQueuedTail(hauler, queueCount);
+                reason = "queue-" + queueReason;
+                return false;
+            }
+
+            if (!carryPlan.TryAddPlannedContainer(item, "planned-drag", out var addReason))
+            {
+                RemoveQueuedTail(hauler, queueCount);
+                chain = null;
+                reason = "container-plan-" + addReason;
+                return false;
+            }
+
+            reason = "planned-drag-container";
+            return true;
+        }
+
+        private static bool TryQueueUtilityDragChain(CondOwner hauler, Task2 task, CondOwner item, Tile tile, out HaulChain chain, out string reason)
+        {
+            return TryQueueVanillaHaulChain(hauler, task, item, tile, out chain, out reason);
+        }
+
+        private static void RemoveQueuedTail(CondOwner hauler, int queueCount)
+        {
+            var queue = hauler?.aQueue;
+            if (queue == null)
+                return;
+
+            while (queue.Count > queueCount)
+                queue.RemoveAt(queue.Count - 1);
+        }
+
+        private static bool IsLooseInventoryPickup(CondOwner hauler, CondOwner item, out string reason)
+        {
+            reason = "other";
+            if (hauler == null || item == null)
+            {
+                reason = "null";
+                return false;
+            }
+
+            if (item.bDestroyed)
+            {
+                reason = "destroyed";
+                return false;
+            }
+
+            if (item.coStackHead != null)
+            {
+                reason = "stack-child";
+                return false;
+            }
+
+            if (item.objCOParent != null || item.slotNow != null || item.HasCond("IsCarried") || item.HasCond("IsInstalled"))
+            {
+                reason = "not-loose";
+                return false;
+            }
+
+            if (item.Item == null)
+            {
+                reason = "not-item";
+                return false;
+            }
+
+            if (!CanTrigger(hauler, item, "PickupItemStack"))
+            {
+                reason = CanTrigger(hauler, item, "PickupDragStart") ? "drag-only" : "no-pickup-stack";
+                return false;
+            }
+
+            reason = "";
+            return true;
+        }
+
+        private static bool IsUtilityDragContainerCandidate(CondOwner hauler, CondOwner item, out string reason)
+        {
+            reason = "other";
+            if (hauler == null || item == null)
+            {
+                reason = "null";
+                return false;
+            }
+
+            if (GetDragSlotItem(hauler) != null || hauler.HasCond("IsDragging"))
+            {
+                reason = "drag-slot-occupied";
+                return false;
+            }
+
+            if (item.bDestroyed)
+            {
+                reason = "destroyed";
+                return false;
+            }
+
+            if (item.coStackHead != null)
+            {
+                reason = "stack-child";
+                return false;
+            }
+
+            if (item.objCOParent != null || item.slotNow != null || item.HasCond("IsCarried") || item.HasCond("IsInstalled"))
+            {
+                reason = "not-loose";
+                return false;
+            }
+
+            if (item.Item == null)
+            {
+                reason = "not-item";
+                return false;
+            }
+
+            if (item.objContainer == null)
+            {
+                reason = "no-container";
+                return false;
+            }
+
+            if (item.objContainer.gridLayout == null && !item.HasCond("IsInfiniteContainer"))
+            {
+                reason = "no-container-grid";
+                return false;
+            }
+
+            if (!CanTrigger(hauler, item, "PickupItemStack") && !HasDragSlot(item) && !CanTrigger(hauler, item, "PickupDragStartNPCPledge") && !CanTrigger(hauler, item, "PickupDragStart"))
+            {
+                reason = "not-draggable";
+                return false;
+            }
+
+            reason = "";
+            return true;
+        }
+
+        private static bool IsOneTripDragCandidate(CondOwner hauler, CondOwner item, out string reason)
+        {
+            reason = "other";
+            if (hauler == null || item == null)
+            {
+                reason = "null";
+                return false;
+            }
+
+            if (GetDragSlotItem(hauler) != null || hauler.HasCond("IsDragging"))
+            {
+                reason = "drag-slot-occupied";
+                return false;
+            }
+
+            if (item.bDestroyed)
+            {
+                reason = "destroyed";
+                return false;
+            }
+
+            if (item.coStackHead != null)
+            {
+                reason = "stack-child";
+                return false;
+            }
+
+            if (item.objCOParent != null || item.slotNow != null || item.HasCond("IsCarried") || item.HasCond("IsInstalled"))
+            {
+                reason = "not-loose";
+                return false;
+            }
+
+            if (item.Item == null)
+            {
+                reason = "not-item";
+                return false;
+            }
+
+            if (!CanTrigger(hauler, item, "PickupItemStack"))
+            {
+                reason = "no-pickup-stack";
+                return false;
+            }
+
+            if (CanTrigger(hauler, item, "PickupDragStart"))
+            {
+                reason = "dragstart";
+                return true;
+            }
+
+            if (HasDragSlot(item))
+            {
+                reason = "dragslot";
+                return true;
+            }
+
+            reason = "no-drag-marker";
+            return false;
+        }
+
+        private static bool IsDragReserveStop(string reason)
+        {
+            return reason == "container-reject" || reason == "too-large";
+        }
+
+        private static bool HasDragSlot(CondOwner item)
+        {
+            try
+            {
+                return item?.mapSlotEffects != null && item.mapSlotEffects.ContainsKey("drag");
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         internal static CondOwner GetDragSlotItem(CondOwner hauler)
         {
             try
             {
-                var slot = hauler?.compSlots?.GetSlot("drag");
-                return slot?.GetOutermostCO();
+                return hauler?.compSlots?.GetSlot("drag")?.GetOutermostCO();
             }
             catch
             {
@@ -72,53 +704,8 @@ namespace OstranautsSmartHaulingFresh
             }
         }
 
-        internal static string DescribeItemSlots(CondOwner item)
+        private static bool CanTrigger(CondOwner hauler, CondOwner item, string interactionName)
         {
-            try
-            {
-                if (item?.mapSlotEffects == null || item.mapSlotEffects.Count == 0)
-                    return "<none>";
-
-                return string.Join(",", item.mapSlotEffects.Keys);
-            }
-            catch
-            {
-                return "<error>";
-            }
-        }
-
-        internal static bool CanFitInventory(CondOwner hauler, CondOwner item)
-        {
-            if (hauler == null || item == null)
-                return false;
-
-            try
-            {
-                if (hauler.objContainer != null && hauler.objContainer.CanFit(item, bAuto: false, bSub: true))
-                    return true;
-
-                if (hauler.compSlots != null)
-                {
-                    foreach (var slot in hauler.compSlots.GetSlotsHeldFirst(bDeep: true))
-                    {
-                        if (slot != null && slot.CanFit(item, bAuto: false, bSub: true))
-                            return true;
-                    }
-                }
-            }
-            catch
-            {
-                return false;
-            }
-
-            return false;
-        }
-
-        internal static bool CanTrigger(CondOwner hauler, CondOwner item, string interactionName)
-        {
-            if (hauler == null || item == null || string.IsNullOrEmpty(interactionName))
-                return false;
-
             var interaction = DataHandler.GetInteraction(interactionName);
             if (interaction == null)
                 return false;
@@ -135,378 +722,11 @@ namespace OstranautsSmartHaulingFresh
             }
         }
 
-        internal static bool IsDolly(CondOwner item)
-        {
-            if (item == null)
-                return false;
-
-            try
-            {
-                if (item.HasCond("IsDolly"))
-                    return true;
-            }
-            catch
-            {
-            }
-
-            var text = ((item.strNameFriendly ?? "") + " " + (item.strName ?? "") + " " + (item.strCODef ?? "")).ToLowerInvariant();
-            return text.Contains("dolly") || text.Contains("equipment truck");
-        }
-
-        internal static CondOwner GetDraggedDolly(CondOwner hauler)
-        {
-            var dragged = GetDragSlotItem(hauler);
-            return IsDolly(dragged) ? dragged : null;
-        }
-
-        internal static bool CanFitDraggedDolly(CondOwner hauler, CondOwner item)
-        {
-            var dolly = GetDraggedDolly(hauler);
-            if (dolly?.objContainer == null || item == null)
-                return false;
-
-            try
-            {
-                return dolly.objContainer.CanFit(item, bAuto: false, bSub: true);
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        internal static int GetDraggedDollyBatchLimit(CondOwner hauler)
-        {
-            var dolly = GetDraggedDolly(hauler);
-            if (dolly == null)
-                return 0;
-
-            return 200;
-        }
-    }
-
-    internal static class BatchSafety
-    {
-        internal static bool ShouldUseVanillaCarry(CondOwner hauler, CondOwner item, out string reason)
-        {
-            reason = "";
-            if (item == null)
-                return false;
-
-            if (ItemDiagnostics.CanTrigger(hauler, item, "PickupDragStart"))
-            {
-                reason = "dragstart";
-                return true;
-            }
-
-            if (!IsSafeBatchCarryItem(item, out reason))
-                return true;
-
-            return false;
-        }
-
-        internal static bool ShouldUseVanillaBuildCarry(CondOwner hauler, CondOwner item, out string reason)
-        {
-            if (CanUseDraggedDollyForBuild(hauler, item))
-            {
-                reason = "dolly";
-                return false;
-            }
-
-            return ShouldUseVanillaCarry(hauler, item, out reason);
-        }
-
-        internal static bool CanUseDraggedDollyForBuild(CondOwner hauler, CondOwner item)
-        {
-            if (hauler == null || item == null)
-                return false;
-
-            if (!HasDragSlot(item))
-                return false;
-
-            return ItemDiagnostics.CanFitDraggedDolly(hauler, item)
-                && ItemDiagnostics.CanTrigger(hauler, item, "PickupItemStack");
-        }
-
-        internal static bool IsSafeBatchCarryItem(CondOwner item, out string reason)
-        {
-            reason = "";
-            if (item == null)
-            {
-                reason = "null";
-                return false;
-            }
-
-            if (IsKnownBulkyCarryItem(item))
-            {
-                reason = "bulky";
-                return false;
-            }
-
-            if (HasAnyCond(item, "IsCumbersome", "IsOversized", "IsContainer"))
-            {
-                reason = "bulkycond";
-                return false;
-            }
-
-            if (HasDragSlot(item) && !IsStackableLooseFloor(item))
-            {
-                reason = "dragslot";
-                return false;
-            }
-
-            reason = "safe";
-            return true;
-        }
-
-        private static bool IsKnownBulkyCarryItem(CondOwner item)
-        {
-            var text = ((item.strNameFriendly ?? "") + " " + (item.strName ?? "") + " " + (item.strCODef ?? "")).ToLowerInvariant();
-            return text.Contains("crate")
-                || text.Contains("wall")
-                || text.Contains("hull")
-                || text.Contains("door")
-                || text.Contains("pump")
-                || text.Contains("regulator")
-                || text.Contains("cooler")
-                || text.Contains("canister")
-                || text.Contains("bottle");
-        }
-
-        private static bool HasAnyCond(CondOwner item, params string[] conds)
-        {
-            if (item == null || conds == null)
-                return false;
-
-            foreach (var cond in conds)
-            {
-                try
-                {
-                    if (item.HasCond(cond))
-                        return true;
-                }
-                catch
-                {
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
-        private static bool HasDragSlot(CondOwner item)
-        {
-            try
-            {
-                return item?.mapSlotEffects != null && item.mapSlotEffects.ContainsKey("drag");
-            }
-            catch
-            {
-                return true;
-            }
-        }
-
-        private static bool IsStackableLooseFloor(CondOwner item)
-        {
-            if (item == null || item.nStackLimit <= 1)
-                return false;
-
-            var text = ((item.strNameFriendly ?? "") + " " + (item.strName ?? "") + " " + (item.strCODef ?? "") + " " + (item.strItemDef ?? "")).ToLowerInvariant();
-            return text.Contains("floor")
-                && !text.Contains("wall")
-                && !text.Contains("door")
-                && !text.Contains("hull");
-        }
-    }
-
-    internal static class SimpleHaulBatcher
-    {
-        private const int HardSafetyLimit = 200;
-        private static readonly HashSet<string> CompactingHaulerIDs = new HashSet<string>();
-
-        internal static void TryCompactVanillaHaulQueue(CondOwner hauler)
-        {
-            if (hauler?.aQueue == null || hauler.aQueue.Count < 3 || string.IsNullOrEmpty(hauler.strID))
-                return;
-
-            lock (CompactingHaulerIDs)
-            {
-                if (CompactingHaulerIDs.Contains(hauler.strID))
-                    return;
-
-                CompactingHaulerIDs.Add(hauler.strID);
-            }
-
-            try
-            {
-                if (!TryReadHaulChain(hauler.aQueue, 0, out var primary))
-                    return;
-
-                Plugin.Log.LogInfo("[DragProbeHaulPrimary] hauler=" + SafeCO(hauler)
-                    + " item={" + ItemDiagnostics.DescribeCarryState(hauler, primary.Item) + "}");
-
-                if (BatchSafety.ShouldUseVanillaCarry(hauler, primary.Item, out var primaryReason))
-                {
-                    Plugin.Log.LogInfo("[SimpleHaulVanillaCarry] hauler=" + SafeCO(hauler)
-                        + " reason=" + primaryReason
-                        + " item={" + ItemDiagnostics.DescribeCarryState(hauler, primary.Item) + "}");
-                    return;
-                }
-
-                var workManager = CrewSim.objInstance?.workManager;
-                if (workManager == null)
-                    return;
-
-                var destinationShipID = GetDestinationShipID(primary);
-                if (string.IsNullOrEmpty(destinationShipID))
-                    return;
-
-                var chains = new List<HaulChain> { primary };
-                var carryBudget = new PlannedCarryBudget(hauler);
-                carryBudget.TryReserve(primary.Item);
-
-                for (var i = 1; i < HardSafetyLimit; i++)
-                {
-                    var task = workManager.ClaimNextTask(hauler);
-                    if (task == null)
-                        break;
-
-                    if (IsVanillaCarryHaulTask(hauler, task, out var item, out var reason))
-                    {
-                        Plugin.Log.LogInfo("[SimpleHaulSkipVanillaCarry] hauler=" + SafeCO(hauler)
-                            + " reason=" + reason
-                            + " item={" + ItemDiagnostics.DescribeCarryState(hauler, item) + "}");
-                        workManager.UnclaimTask(task);
-                        continue;
-                    }
-
-                    if (!TryBuildVanillaHaulChain(hauler, task, destinationShipID, carryBudget, out var chain, out var failReason))
-                    {
-                        if (failReason == "capacity")
-                        {
-                            Plugin.Log.LogInfo("[SimpleHaulCapacityStop] hauler=" + SafeCO(hauler)
-                                + " item={" + ItemDiagnostics.DescribeCarryState(hauler, item) + "}");
-                        }
-
-                        workManager.UnclaimTask(task);
-                        break;
-                    }
-
-                    chains.Add(chain);
-                }
-
-                if (chains.Count <= 1)
-                    return;
-
-                CompactLeadingHaulChains(hauler, chains);
-                Plugin.Log.LogInfo("[SimpleHaulCompacted] hauler=" + SafeCO(hauler)
-                    + " items=" + chains.Count
-                    + " destinationShip=" + destinationShipID
-                    + " queue={" + QueueSummary(hauler) + "}");
-            }
-            finally
-            {
-                lock (CompactingHaulerIDs)
-                {
-                    CompactingHaulerIDs.Remove(hauler.strID);
-                }
-            }
-        }
-
-        private static bool TryBuildVanillaHaulChain(CondOwner hauler, Task2 task, string requiredDestinationShipID, PlannedCarryBudget carryBudget, out HaulChain chain, out string failReason)
-        {
-            chain = null;
-            failReason = "other";
-            if (hauler == null || task == null || !IsHaulTask(task))
-                return false;
-
-            var item = task.GetIA()?.objThem;
-            if (item == null || !WorkManager.CTHaul.Triggered(item))
-                return false;
-
-            Plugin.Log.LogInfo("[DragProbeHaulExtraCandidate] hauler=" + SafeCO(hauler)
-                + " item={" + ItemDiagnostics.DescribeCarryState(hauler, item) + "}");
-
-            if (BatchSafety.ShouldUseVanillaCarry(hauler, item, out var reason))
-            {
-                Plugin.Log.LogInfo("[SimpleHaulSkipVanillaCarry] hauler=" + SafeCO(hauler)
-                    + " reason=" + reason
-                    + " item={" + ItemDiagnostics.DescribeCarryState(hauler, item) + "}");
-                return false;
-            }
-
-            if (carryBudget != null && !carryBudget.TryReserve(item))
-            {
-                failReason = "capacity";
-                return false;
-            }
-
-            var tile = ResolveHaulDestination(hauler, task, item);
-            if (tile?.coProps == null || string.IsNullOrEmpty(task.strTileShip) || task.strTileShip != requiredDestinationShipID)
-                return false;
-
-            var pickup = DataHandler.GetInteraction("PickupItemStack");
-            var walk = DataHandler.GetInteraction("Walk");
-            var drop = DataHandler.GetInteraction("DropItemStack");
-            if (pickup == null || walk == null || drop == null)
-                return false;
-
-            hauler.QueueInteraction(item, pickup);
-
-            task.strInteraction = pickup.strName;
-
-            walk.strTargetPoint = "use";
-            walk.fTargetPointRange = 0f;
-            hauler.QueueInteraction(tile.coProps, walk);
-
-            hauler.QueueInteraction(item, drop);
-            task.SetIA(drop);
-
-            chain = new HaulChain(item, pickup, walk, drop);
-            failReason = "";
-            return true;
-        }
-
-        private static bool TryReadHaulTaskCandidate(CondOwner hauler, Task2 task, out CondOwner item, out string destinationShipID, out string skipReason)
-        {
-            item = null;
-            destinationShipID = null;
-            skipReason = "other";
-
-            if (hauler == null || task == null || !IsHaulTask(task))
-                return false;
-
-            item = task.GetIA()?.objThem;
-            if (item == null || !WorkManager.CTHaul.Triggered(item))
-            {
-                skipReason = "nothaulable";
-                return false;
-            }
-
-            var tile = ResolveHaulDestination(hauler, task, item);
-            if (tile?.coProps == null || string.IsNullOrEmpty(task.strTileShip))
-            {
-                skipReason = "destination";
-                return false;
-            }
-
-            destinationShipID = task.strTileShip;
-            skipReason = "";
-            return true;
-        }
-
-        private static bool IsVanillaCarryHaulTask(CondOwner hauler, Task2 task, out CondOwner item, out string reason)
-        {
-            item = null;
-            reason = "";
-            if (!TryReadHaulTaskCandidate(hauler, task, out item, out _, out _))
-                return false;
-
-            return BatchSafety.ShouldUseVanillaCarry(hauler, item, out reason);
-        }
-
         private static Tile ResolveHaulDestination(CondOwner hauler, Task2 task, CondOwner item)
         {
+            if (hauler == null || task == null || item == null)
+                return null;
+
             Tile tile = null;
             Ship targetShip = null;
             CrewSim.system.dictShips.TryGetValue(task.strTileShip, out targetShip);
@@ -517,25 +737,290 @@ namespace OstranautsSmartHaulingFresh
                 {
                     tile = targetShip.aTiles[task.nTile];
                 }
-                else if (CrewSim.objInstance.workManager.HaulZone(hauler, task, item) != null)
+                else if (CrewSim.objInstance?.workManager?.HaulZone(hauler, task, item) != null)
                 {
-                    tile = hauler.ship.aTiles[task.nTile];
                     CrewSim.system.dictShips.TryGetValue(task.strTileShip, out targetShip);
+                    if (targetShip != null && targetShip.aTiles.Count > task.nTile)
+                        tile = targetShip.aTiles[task.nTile];
                 }
             }
 
             return tile;
         }
 
-        private static void CompactLeadingHaulChains(CondOwner hauler, List<HaulChain> chains)
+        private static void SortPickupChainsNearestNeighbor(CondOwner hauler, List<HaulChain> chains)
+        {
+            if (hauler == null || chains == null || chains.Count <= 1)
+                return;
+
+            var currentTile = GetCurrentTile(hauler);
+            var remaining = new List<PickupSortTarget>();
+            for (var i = 0; i < chains.Count; i++)
+            {
+                remaining.Add(new PickupSortTarget
+                {
+                    Chain = chains[i],
+                    Tile = GetPickupTile(hauler, chains[i]),
+                    OriginalIndex = i
+                });
+            }
+
+            var orderedTargets = new List<PickupSortTarget>(chains.Count);
+            var usedPathScores = 0;
+            var usedFallbackScores = 0;
+
+            while (remaining.Count > 0)
+            {
+                var bestIndex = 0;
+                PickupSortScore bestScore = null;
+
+                for (var i = 0; i < remaining.Count; i++)
+                {
+                    var score = ScorePickupTarget(hauler, currentTile, remaining[i]);
+                    if (score.UsedPath)
+                        usedPathScores++;
+                    else
+                        usedFallbackScores++;
+
+                    if (bestScore == null || IsBetterPickupScore(score, bestScore))
+                    {
+                        bestScore = score;
+                        bestIndex = i;
+                    }
+                }
+
+                var selected = remaining[bestIndex];
+                remaining.RemoveAt(bestIndex);
+                orderedTargets.Add(selected);
+
+                if (selected.Tile != null)
+                    currentTile = selected.Tile;
+            }
+
+            var changed = false;
+            for (var i = 0; i < orderedTargets.Count; i++)
+            {
+                if (orderedTargets[i].Chain != chains[i])
+                {
+                    changed = true;
+                    break;
+                }
+            }
+
+            chains.Clear();
+            foreach (var target in orderedTargets)
+                chains.Add(target.Chain);
+
+            Plugin.Log.LogInfo("[V2PickupSort] hauler=" + SafeCO(hauler)
+                + " count=" + chains.Count
+                + " changed=" + changed
+                + " pathScores=" + usedPathScores
+                + " fallbackScores=" + usedFallbackScores
+                + " order={" + PickupOrderSummary(orderedTargets, 10) + "}");
+        }
+
+        private static PickupSortScore ScorePickupTarget(CondOwner hauler, Tile currentTile, PickupSortTarget target)
+        {
+            var score = new PickupSortScore
+            {
+                OriginalIndex = target?.OriginalIndex ?? int.MaxValue,
+                SameRoom = SameRoom(currentTile, target?.Tile),
+                TileRange = TileRangeSafe(currentTile, target?.Tile),
+                Cost = float.MaxValue,
+                UsedPath = false
+            };
+
+            if (target == null)
+                return score;
+
+            if (TryGetPathCost(hauler, currentTile, target.Tile, target.Chain?.Item, target.Chain?.Pickup, out var pathCost))
+            {
+                score.Cost = pathCost;
+                score.UsedPath = true;
+                return score;
+            }
+
+            score.Cost = FallbackDistanceSq(hauler, currentTile, target);
+            return score;
+        }
+
+        private static bool IsBetterPickupScore(PickupSortScore candidate, PickupSortScore currentBest)
+        {
+            if (candidate.UsedPath != currentBest.UsedPath)
+                return candidate.UsedPath;
+
+            if (candidate.Cost < currentBest.Cost)
+                return true;
+
+            if (candidate.Cost > currentBest.Cost)
+                return false;
+
+            if (candidate.SameRoom != currentBest.SameRoom)
+                return candidate.SameRoom;
+
+            if (candidate.TileRange != currentBest.TileRange)
+                return candidate.TileRange < currentBest.TileRange;
+
+            return candidate.OriginalIndex < currentBest.OriginalIndex;
+        }
+
+        private static bool TryGetPathCost(CondOwner hauler, Tile currentTile, Tile targetTile, CondOwner item, Interaction pickup, out float cost)
+        {
+            cost = float.MaxValue;
+            if (hauler == null || currentTile == null || targetTile == null)
+                return false;
+
+            if (currentTile == targetTile)
+            {
+                cost = 0f;
+                return true;
+            }
+
+            var pathfinder = hauler.Pathfinder;
+            if (pathfinder == null)
+                return false;
+
+            try
+            {
+                var allowAirlocks = hauler.HasAirlockPermission(false);
+                if (pathfinder.tilCurrent == currentTile)
+                {
+                    var range = pickup == null ? 1f : Math.Max(0f, pickup.fTargetPointRange);
+                    var result = pathfinder.CheckGoal(targetTile, range, item, allowAirlocks);
+                    if (result != null && result.HasPath && result.PathLength >= 0f)
+                    {
+                        cost = result.PathLength;
+                        return true;
+                    }
+                }
+
+                var path = GetPathToWalkableOriginMethod?.Invoke(pathfinder, new object[] { currentTile, targetTile }) as List<Tile>;
+                if (path != null && path.Count > 0)
+                {
+                    cost = path.Count;
+                    return true;
+                }
+            }
+            catch
+            {
+            }
+
+            return false;
+        }
+
+        private static Tile GetCurrentTile(CondOwner hauler)
+        {
+            try
+            {
+                if (hauler?.Pathfinder?.tilCurrent != null)
+                    return hauler.Pathfinder.tilCurrent;
+
+                if (hauler?.ship != null && hauler.tf != null)
+                    return hauler.ship.GetTileAtWorldCoords1(hauler.tf.position.x, hauler.tf.position.y, true, true);
+            }
+            catch
+            {
+            }
+
+            return null;
+        }
+
+        private static Tile GetPickupTile(CondOwner hauler, HaulChain chain)
+        {
+            if (hauler?.ship == null || chain?.Item == null)
+                return null;
+
+            try
+            {
+                var targetPoint = chain.Pickup?.strTargetPoint;
+                if (string.IsNullOrEmpty(targetPoint) || string.Equals(targetPoint, "remote", StringComparison.OrdinalIgnoreCase))
+                    targetPoint = "use";
+
+                var pos = chain.Item.GetPos(targetPoint);
+                return hauler.ship.GetTileAtWorldCoords1(pos.x, pos.y, true, true);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static bool SameRoom(Tile a, Tile b)
+        {
+            return a?.room != null && b?.room != null && a.room == b.room;
+        }
+
+        private static int TileRangeSafe(Tile a, Tile b)
+        {
+            try
+            {
+                if (a != null && b != null)
+                    return Math.Max(0, TileUtils.TileRange(a, b));
+            }
+            catch
+            {
+            }
+
+            return int.MaxValue;
+        }
+
+        private static float FallbackDistanceSq(CondOwner hauler, Tile currentTile, PickupSortTarget target)
+        {
+            try
+            {
+                var pa = currentTile?.tf?.position ?? hauler.tf.position;
+                var pb = target?.Tile?.tf?.position ?? target?.Chain?.Item?.tf?.position ?? pa;
+                var dx = pa.x - pb.x;
+                var dy = pa.y - pb.y;
+                return dx * dx + dy * dy;
+            }
+            catch
+            {
+                return float.MaxValue;
+            }
+        }
+
+        private static string PickupOrderSummary(List<PickupSortTarget> targets, int max)
+        {
+            if (targets == null || targets.Count == 0)
+                return "<none>";
+
+            var sb = new StringBuilder();
+            var count = Math.Min(targets.Count, max);
+            for (var i = 0; i < count; i++)
+            {
+                if (i > 0)
+                    sb.Append(" | ");
+
+                var target = targets[i];
+                sb.Append(i)
+                    .Append(":")
+                    .Append(SafeCO(target?.Chain?.Item))
+                    .Append("@tile=")
+                    .Append(target?.Tile?.Index.ToString() ?? "?")
+                    .Append("/orig=")
+                    .Append(target?.OriginalIndex.ToString() ?? "?");
+            }
+
+            if (targets.Count > count)
+                sb.Append(" | ...");
+
+            return sb.ToString();
+        }
+
+        private static void CompactLeadingHaulChains(CondOwner hauler, HaulChain utilityDragChain, List<HaulChain> chains)
         {
             var queue = hauler.aQueue;
-            var consumed = chains.Count * 3;
+            var consumed = ((chains?.Count ?? 0) + (utilityDragChain == null ? 0 : 1)) * 3;
             var tail = new List<Interaction>();
             for (var i = consumed; i < queue.Count; i++)
                 tail.Add(queue[i]);
 
             queue.Clear();
+
+            if (utilityDragChain != null)
+                queue.Add(utilityDragChain.Pickup);
+
             foreach (var chain in chains)
                 queue.Add(chain.Pickup);
 
@@ -547,75 +1032,15 @@ namespace OstranautsSmartHaulingFresh
                 queue.Add(chain.Drop);
             }
 
+            if (utilityDragChain != null)
+            {
+                if (queue.Count == 0 || queue[queue.Count - 1].objThem != utilityDragChain.Walk.objThem)
+                    queue.Add(utilityDragChain.Walk);
+
+                queue.Add(utilityDragChain.Drop);
+            }
+
             queue.AddRange(tail);
-        }
-
-        private static void RemoveLeadingHaulChain(CondOwner hauler, HaulChain chain)
-        {
-            var queue = hauler?.aQueue;
-            if (queue == null || chain == null)
-                return;
-
-            if (queue.Count >= 3
-                && queue[0] == chain.Pickup
-                && queue[1] == chain.Walk
-                && queue[2] == chain.Drop)
-            {
-                queue.RemoveRange(0, 3);
-            }
-        }
-
-        private static bool IsHaulTask(Task2 task)
-        {
-            return task != null
-                && string.Equals(task.strDuty, "Haul", StringComparison.OrdinalIgnoreCase)
-                && string.Equals(task.strInteraction, "ACTHaulItem", StringComparison.OrdinalIgnoreCase);
-        }
-
-        private static bool IsNamed(Interaction interaction, string name)
-        {
-            return interaction != null && string.Equals(interaction.strName, name, StringComparison.OrdinalIgnoreCase);
-        }
-
-        private static string SafeCO(CondOwner co)
-        {
-            if (co == null)
-                return "<null>";
-
-            var name = string.IsNullOrEmpty(co.strNameFriendly) ? co.strName : co.strNameFriendly;
-            return (co.strID ?? "?") + "/" + (name ?? "?");
-        }
-
-        private static string QueueSummary(CondOwner hauler)
-        {
-            if (hauler?.aQueue == null)
-                return "<null>";
-
-            var sb = new StringBuilder();
-            sb.Append("count=").Append(hauler.aQueue.Count).Append(" [");
-            var max = Math.Min(hauler.aQueue.Count, 16);
-            for (var i = 0; i < max; i++)
-            {
-                if (i > 0)
-                    sb.Append("; ");
-
-                var interaction = hauler.aQueue[i];
-                sb.Append(i).Append(":");
-                sb.Append(interaction?.strName ?? "?");
-                sb.Append("->");
-                sb.Append(SafeCO(interaction?.objThem));
-            }
-
-            if (hauler.aQueue.Count > max)
-                sb.Append("; ...");
-
-            sb.Append("]");
-            return sb.ToString();
-        }
-
-        private static string GetDestinationShipID(HaulChain chain)
-        {
-            return chain?.Walk?.objThem?.ship?.strRegID;
         }
 
         private static bool TryReadHaulChain(List<Interaction> queue, int index, out HaulChain chain)
@@ -642,529 +1067,21 @@ namespace OstranautsSmartHaulingFresh
             return true;
         }
 
-        private sealed class PlannedCarryBudget
+        private static bool IsHaulTask(Task2 task)
         {
-            private readonly HashSet<string> _stackKeys = new HashSet<string>();
-            private int _freeSlots;
-
-            internal PlannedCarryBudget(CondOwner hauler)
-            {
-                _freeSlots = CountFreeSlots(hauler);
-                if (_freeSlots <= 0)
-                    _freeSlots = 1;
-            }
-
-            internal bool TryReserve(CondOwner item)
-            {
-                if (item == null)
-                    return false;
-
-                if (item.nStackLimit > 1)
-                {
-                    var key = StackKey(item);
-                    if (_stackKeys.Contains(key))
-                        return true;
-
-                    if (_freeSlots <= 0)
-                        return false;
-
-                    _stackKeys.Add(key);
-                    _freeSlots--;
-                    return true;
-                }
-
-                if (_freeSlots <= 0)
-                    return false;
-
-                _freeSlots--;
-                return true;
-            }
-
-            private static int CountFreeSlots(CondOwner hauler)
-            {
-                if (hauler?.compSlots == null)
-                    return 0;
-
-                try
-                {
-                    var count = 0;
-                    foreach (var slot in hauler.compSlots.GetSlotsHeldFirst(bDeep: true))
-                    {
-                        if (slot != null && slot.GetOutermostCO() == null)
-                            count++;
-                    }
-
-                    return count;
-                }
-                catch
-                {
-                    return 0;
-                }
-            }
-
-            private static string StackKey(CondOwner item)
-            {
-                return item.strCODef
-                    ?? item.strItemDef
-                    ?? item.strName
-                    ?? item.strNameFriendly
-                    ?? item.strID
-                    ?? "";
-            }
+            return task != null
+                && string.Equals(task.strDuty, "Haul", StringComparison.OrdinalIgnoreCase)
+                && string.Equals(task.strInteraction, "ACTHaulItem", StringComparison.OrdinalIgnoreCase);
         }
 
-        private sealed class HaulChain
+        private static bool IsNamed(Interaction interaction, string name)
         {
-            internal HaulChain(CondOwner item, Interaction pickup, Interaction walk, Interaction drop)
-            {
-                Item = item;
-                Pickup = pickup;
-                Walk = walk;
-                Drop = drop;
-            }
-
-            internal CondOwner Item { get; }
-            internal Interaction Pickup { get; }
-            internal Interaction Walk { get; }
-            internal Interaction Drop { get; }
-        }
-    }
-
-    internal static class BuildMaterialFetchBatcher
-    {
-        private const int FetchSafetyLimit = 200;
-        private static readonly HashSet<string> BatchingHaulerIDs = new HashSet<string>();
-
-        internal static void TryBatchQueuedMaterialFetches(CondOwner hauler, Interaction insertedInteraction, bool insertedAtFront)
-        {
-            if (hauler?.aQueue == null || insertedInteraction == null || !insertedAtFront || string.IsNullOrEmpty(hauler.strID))
-            {
-                return;
-            }
-
-            if (!IsPickup(insertedInteraction))
-                return;
-
-            if (hauler.aQueue.Count < 2)
-                return;
-
-            if (hauler.aQueue[0] != insertedInteraction)
-                return;
-
-            var buildInteraction = hauler.aQueue[1];
-            if (!IsBuildOrInstallInteraction(buildInteraction)
-                || buildInteraction.aSeekItemsForContract == null
-                || buildInteraction.aSeekItemsForContract.Count == 0)
-            {
-                return;
-            }
-
-            lock (BatchingHaulerIDs)
-            {
-                if (BatchingHaulerIDs.Contains(hauler.strID))
-                    return;
-
-                BatchingHaulerIDs.Add(hauler.strID);
-            }
-
-            try
-            {
-            if (!TryGetRequiredMaterialTrigger(buildInteraction, out var requiredMaterial))
-                return;
-
-                Plugin.Log.LogInfo("[DragProbeBuildPrimary] hauler=" + SafeCO(hauler)
-                    + " build=" + buildInteraction.strName
-                    + " material=" + requiredMaterial.strName
-                    + " item={" + ItemDiagnostics.DescribeCarryState(hauler, insertedInteraction.objThem) + "}");
-
-                if (BatchSafety.ShouldUseVanillaBuildCarry(hauler, insertedInteraction.objThem, out var primaryReason))
-                {
-                    Plugin.Log.LogInfo("[BuildFetchVanillaCarry] hauler=" + SafeCO(hauler)
-                        + " build=" + buildInteraction.strName
-                        + " reason=" + primaryReason
-                        + " item={" + ItemDiagnostics.DescribeCarryState(hauler, insertedInteraction.objThem) + "}");
-                    return;
-                }
-
-                var extras = FindExtraBuildMaterials(hauler, requiredMaterial, insertedInteraction.objThem);
-                if (extras.Count == 0)
-                    return;
-
-                var insertIndex = 1;
-                foreach (var item in extras)
-                {
-                    var pickup = NewMaterialPickup(buildInteraction);
-                    if (pickup == null)
-                        break;
-
-                    pickup.objUs = hauler;
-                    pickup.objThem = item;
-                    pickup.bManual = buildInteraction.bManual;
-                    pickup.strChainOwner = hauler.strID;
-                    hauler.aQueue.Insert(insertIndex, pickup);
-                    insertIndex++;
-                }
-
-                buildInteraction.bRetestItems = true;
-                Plugin.Log.LogInfo("[BuildFetchBatched] hauler=" + SafeCO(hauler)
-                    + " build=" + buildInteraction.strName
-                    + " material=" + requiredMaterial.strName
-                    + " extraPickups=" + extras.Count
-                    + " queue={" + QueueSummary(hauler) + "}");
-            }
-            finally
-            {
-                lock (BatchingHaulerIDs)
-                    BatchingHaulerIDs.Remove(hauler.strID);
-            }
+            return interaction != null && string.Equals(interaction.strName, name, StringComparison.OrdinalIgnoreCase);
         }
 
-        private static bool TryGetRequiredMaterialTrigger(Interaction buildInteraction, out CondTrigger requiredMaterial)
+        private static string GetDestinationShipID(HaulChain chain)
         {
-            requiredMaterial = null;
-            if (buildInteraction == null || string.IsNullOrEmpty(buildInteraction.strName))
-                return false;
-
-            const string feedPrefix = "ACTFeedItem";
-            if (!buildInteraction.strName.StartsWith(feedPrefix, StringComparison.OrdinalIgnoreCase))
-                return false;
-
-            var triggerName = buildInteraction.strName.Substring(feedPrefix.Length);
-            if (string.IsNullOrEmpty(triggerName))
-                return false;
-
-            requiredMaterial = DataHandler.GetCondTrigger(triggerName);
-            return requiredMaterial != null;
-        }
-
-        private static Interaction NewMaterialPickup(Interaction buildInteraction)
-        {
-            var pickupName = buildInteraction.bEquip
-                ? "EquipItem"
-                : ((!buildInteraction.bLot && !buildInteraction.bGiveWholeStack) ? "PickupItem" : "PickupItemStack");
-
-            return DataHandler.GetInteraction(pickupName);
-        }
-
-        private static CondOwner TakeNextDistinctSeekItem(List<CondOwner> seekItems, CondOwner alreadyQueued)
-        {
-            if (seekItems == null || seekItems.Count == 0)
-                return null;
-
-            for (var i = 0; i < seekItems.Count; i++)
-            {
-                var item = seekItems[i];
-                if (item == null)
-                {
-                    seekItems.RemoveAt(i);
-                    i--;
-                    continue;
-                }
-
-                if (item == alreadyQueued || (!string.IsNullOrEmpty(item.strID) && item.strID == alreadyQueued?.strID))
-                    continue;
-
-                seekItems.RemoveAt(i);
-                return item;
-            }
-
-            return null;
-        }
-
-        private static List<CondOwner> FindExtraBuildMaterials(CondOwner hauler, CondTrigger requiredMaterial, CondOwner alreadyQueued)
-        {
-            var extras = new List<CondOwner>();
-            if (hauler?.ship == null || requiredMaterial == null)
-                return extras;
-
-            List<CondOwner> candidates;
-            try
-            {
-                candidates = hauler.ship.GetCOs(requiredMaterial, bSubObjects: true, bAllowDocked: true, bAllowLocked: false);
-            }
-            catch (Exception ex)
-            {
-                Plugin.Log.LogWarning("[BuildFetchFindFailed] trigger=" + requiredMaterial.strName
-                    + " error=" + ex.GetType().Name);
-                return extras;
-            }
-
-            if (candidates == null || candidates.Count == 0)
-                return extras;
-
-            var effectiveLimit = FetchSafetyLimit;
-            var dollyLimit = 0;
-            if (BatchSafety.CanUseDraggedDollyForBuild(hauler, alreadyQueued))
-            {
-                dollyLimit = ItemDiagnostics.GetDraggedDollyBatchLimit(hauler);
-                effectiveLimit = Math.Max(0, dollyLimit - 1);
-            }
-
-            if (effectiveLimit <= 0)
-                return extras;
-
-            candidates.Sort((a, b) => DistanceSq(hauler, a).CompareTo(DistanceSq(hauler, b)));
-            var seen = new HashSet<string>();
-            if (!string.IsNullOrEmpty(alreadyQueued?.strID))
-                seen.Add(alreadyQueued.strID);
-
-            var carryBudget = new PlannedMaterialBudget();
-            carryBudget.TryReserve(alreadyQueued);
-
-            var skippedNoFit = 0;
-            var skippedNoPickup = 0;
-            var skippedDragOnly = 0;
-            var skippedVanillaCarry = 0;
-            var skippedCapacity = 0;
-            var skippedOther = 0;
-            foreach (var item in candidates)
-            {
-                if (extras.Count >= effectiveLimit)
-                    break;
-
-                if (!IsCandidateBuildMaterial(hauler, item, requiredMaterial, seen, out var skipReason))
-                {
-                    if (skipReason == "nofit")
-                        skippedNoFit++;
-                    else if (skipReason == "nopickup")
-                        skippedNoPickup++;
-                    else if (skipReason == "dragonly")
-                        skippedDragOnly++;
-                    else if (skipReason == "vanillacarry")
-                        skippedVanillaCarry++;
-                    else if (skipReason == "capacity")
-                        skippedCapacity++;
-                    else
-                        skippedOther++;
-                    continue;
-                }
-
-                if (!carryBudget.TryReserve(item))
-                {
-                    skippedCapacity++;
-                    continue;
-                }
-
-                seen.Add(item.strID);
-                extras.Add(item);
-            }
-
-            Plugin.Log.LogInfo("[DragProbeBuildFind] hauler=" + SafeCO(hauler)
-                + " material=" + requiredMaterial.strName
-                + " candidates=" + candidates.Count
-                + " selected=" + extras.Count
-                + " limit=" + effectiveLimit
-                + " dollyLimit=" + dollyLimit
-                + " skippedNoFit=" + skippedNoFit
-                + " skippedNoPickup=" + skippedNoPickup
-                + " skippedDragOnly=" + skippedDragOnly
-                + " skippedVanillaCarry=" + skippedVanillaCarry
-                + " skippedCapacity=" + skippedCapacity
-                + " skippedOther=" + skippedOther
-                + " firstSelected={" + DescribeSelectedItems(hauler, extras, 6) + "}");
-
-            return extras;
-        }
-
-        private static bool IsCandidateBuildMaterial(CondOwner hauler, CondOwner item, CondTrigger requiredMaterial, HashSet<string> seen, out string skipReason)
-        {
-            skipReason = "other";
-            if (hauler == null || item == null || requiredMaterial == null || string.IsNullOrEmpty(item.strID))
-                return false;
-
-            if (seen != null && seen.Contains(item.strID))
-            {
-                skipReason = "seen";
-                return false;
-            }
-
-            if (item.bDestroyed || item.Item == null || item.objCOParent != null || item.HasCond("IsCarried") || item.HasCond("IsInstalled"))
-            {
-                skipReason = "state";
-                return false;
-            }
-
-            if (item.GetComponent<Placeholder>() != null)
-            {
-                skipReason = "placeholder";
-                return false;
-            }
-
-            if (IsAlreadyQueuedForPickup(hauler, item))
-            {
-                skipReason = "queued";
-                return false;
-            }
-
-            if (BatchSafety.ShouldUseVanillaBuildCarry(hauler, item, out _))
-            {
-                skipReason = "vanillacarry";
-                return false;
-            }
-
-            try
-            {
-                if (!requiredMaterial.Triggered(item))
-                {
-                    skipReason = "trigger";
-                    return false;
-                }
-            }
-            catch
-            {
-                skipReason = "trigger";
-                return false;
-            }
-
-            var fits = CanCurrentlyFit(hauler, item);
-            var pickup = CanPickupNow(hauler, item);
-            var drag = ItemDiagnostics.CanTrigger(hauler, item, "PickupDragStart");
-
-            if (!fits)
-            {
-                skipReason = drag ? "dragonly" : "nofit";
-                return false;
-            }
-
-            if (!pickup)
-            {
-                skipReason = "nopickup";
-                return false;
-            }
-
-            skipReason = "";
-            return true;
-        }
-
-        private static bool IsAlreadyQueuedForPickup(CondOwner hauler, CondOwner item)
-        {
-            if (hauler?.aQueue == null || item == null)
-                return false;
-
-            foreach (var queued in hauler.aQueue)
-            {
-                if (IsPickup(queued) && queued.objThem == item)
-                    return true;
-            }
-
-            return false;
-        }
-
-        private static bool CanCurrentlyFit(CondOwner hauler, CondOwner item)
-        {
-            if (hauler == null || item == null)
-                return false;
-
-            try
-            {
-                if (ItemDiagnostics.CanFitDraggedDolly(hauler, item))
-                    return true;
-
-                if (hauler.objContainer != null && hauler.objContainer.CanFit(item, bAuto: false, bSub: true))
-                    return true;
-
-                if (hauler.compSlots != null)
-                {
-                    foreach (var slot in hauler.compSlots.GetSlotsHeldFirst(bDeep: true))
-                    {
-                        if (slot != null && slot.CanFit(item, bAuto: false, bSub: true))
-                            return true;
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Plugin.Log.LogWarning("[BuildFetchFitCheckFailed] hauler=" + SafeCO(hauler)
-                    + " item=" + SafeCO(item)
-                    + " error=" + ex.GetType().Name);
-            }
-
-            return false;
-        }
-
-        private static bool CanPickupNow(CondOwner hauler, CondOwner item)
-        {
-            var pickup = DataHandler.GetInteraction("PickupItemStack");
-            if (pickup == null)
-                return false;
-
-            try
-            {
-                pickup.bVerboseTrigger = false;
-                pickup.bHumanOnly = false;
-                return pickup.Triggered(hauler, item, bStats: false, bIgnoreItems: false, bCheckPath: true, bFetchItems: false);
-            }
-            catch (Exception ex)
-            {
-                Plugin.Log.LogWarning("[BuildFetchPickupCheckFailed] hauler=" + SafeCO(hauler)
-                    + " item=" + SafeCO(item)
-                    + " error=" + ex.GetType().Name);
-                return false;
-            }
-        }
-
-        private sealed class PlannedMaterialBudget
-        {
-            private readonly Dictionary<string, int> _stackCounts = new Dictionary<string, int>();
-
-            internal bool TryReserve(CondOwner item)
-            {
-                if (item == null)
-                    return false;
-
-                if (item.nStackLimit <= 1)
-                    return true;
-
-                var key = StackKey(item);
-                _stackCounts.TryGetValue(key, out var count);
-                var newCount = count + Math.Max(1, item.StackCount);
-                if (newCount > item.nStackLimit)
-                    return false;
-
-                _stackCounts[key] = newCount;
-                return true;
-            }
-
-            private static string StackKey(CondOwner item)
-            {
-                return item.strCODef
-                    ?? item.strItemDef
-                    ?? item.strName
-                    ?? item.strNameFriendly
-                    ?? item.strID
-                    ?? "";
-            }
-        }
-
-        private static bool IsBuildOrInstallInteraction(Interaction interaction)
-        {
-            if (interaction == null || string.IsNullOrEmpty(interaction.strName))
-                return false;
-
-            if (DataHandler.dictInstallables2 != null && DataHandler.dictInstallables2.ContainsKey(interaction.strName))
-                return true;
-
-            return !string.IsNullOrEmpty(interaction.strStartInstall)
-                || (interaction.objThem != null
-                    && (!string.IsNullOrEmpty(interaction.objThem.strPlaceholderInstallReq)
-                        || !string.IsNullOrEmpty(interaction.objThem.strPlaceholderInstallFinish)));
-        }
-
-        private static bool IsPickup(Interaction interaction)
-        {
-            return interaction != null
-                && (string.Equals(interaction.strName, "PickupItemStack", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(interaction.strName, "PickupItem", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(interaction.strName, "EquipItem", StringComparison.OrdinalIgnoreCase));
-        }
-
-        private static string SafeCO(CondOwner co)
-        {
-            if (co == null)
-                return "<null>";
-
-            var name = string.IsNullOrEmpty(co.strNameFriendly) ? co.strName : co.strNameFriendly;
-            return (co.strID ?? "?") + "/" + (name ?? "?");
+            return chain?.Walk?.objThem?.ship?.strRegID;
         }
 
         private static string QueueSummary(CondOwner hauler)
@@ -1174,7 +1091,7 @@ namespace OstranautsSmartHaulingFresh
 
             var sb = new StringBuilder();
             sb.Append("count=").Append(hauler.aQueue.Count).Append(" [");
-            var max = Math.Min(hauler.aQueue.Count, 16);
+            var max = Math.Min(hauler.aQueue.Count, 20);
             for (var i = 0; i < max; i++)
             {
                 if (i > 0)
@@ -1194,40 +1111,740 @@ namespace OstranautsSmartHaulingFresh
             return sb.ToString();
         }
 
-        private static string DescribeSelectedItems(CondOwner hauler, List<CondOwner> items, int max)
+        private static string DescribeItem(CondOwner item)
         {
-            if (items == null || items.Count == 0)
-                return "<none>";
+            if (item == null)
+                return "<null>";
 
-            var sb = new StringBuilder();
-            var count = Math.Min(items.Count, max);
-            for (var i = 0; i < count; i++)
-            {
-                if (i > 0)
-                    sb.Append(" | ");
-
-                sb.Append(ItemDiagnostics.DescribeCarryState(hauler, items[i]));
-            }
-
-            if (items.Count > count)
-                sb.Append(" | ...");
-
-            return sb.ToString();
+            return SafeCO(item)
+                + " def=" + (item.strCODef ?? "?")
+                + " stack=" + item.StackCount + "/" + item.nStackLimit
+                + " parent=" + SafeCO(item.objCOParent)
+                + " slot=" + (item.slotNow?.strName ?? "<none>")
+                + " carried=" + item.HasCond("IsCarried")
+                + " installed=" + item.HasCond("IsInstalled");
         }
 
-        private static float DistanceSq(CondOwner a, CondOwner b)
+        private static string SafeCO(CondOwner co)
         {
+            if (co == null)
+                return "<null>";
+
+            var name = string.IsNullOrEmpty(co.strNameFriendly) ? co.strName : co.strNameFriendly;
+            return (co.strID ?? "?") + "/" + (name ?? "?");
+        }
+
+        internal sealed class HaulChain
+        {
+            internal HaulChain(CondOwner item, Interaction pickup, Interaction walk, Interaction drop)
+            {
+                Item = item;
+                Pickup = pickup;
+                Walk = walk;
+                Drop = drop;
+            }
+
+            internal CondOwner Item { get; }
+            internal Interaction Pickup { get; }
+            internal Interaction Walk { get; }
+            internal Interaction Drop { get; }
+        }
+
+        private sealed class PickupSortTarget
+        {
+            internal HaulChain Chain;
+            internal Tile Tile;
+            internal int OriginalIndex;
+        }
+
+        private sealed class PickupSortScore
+        {
+            internal bool UsedPath;
+            internal bool SameRoom;
+            internal float Cost;
+            internal int TileRange;
+            internal int OriginalIndex;
+        }
+    }
+
+    internal static class HaulBatchRegistry
+    {
+        private static readonly List<Entry> Entries = new List<Entry>();
+        private static int CompletingTaskDepth;
+
+        internal static void BeginCompleteTask()
+        {
+            CompletingTaskDepth++;
+        }
+
+        internal static void EndCompleteTask()
+        {
+            if (CompletingTaskDepth > 0)
+                CompletingTaskDepth--;
+        }
+
+        internal static void Register(CondOwner hauler, List<VanillaHaulBatcher.HaulChain> chains)
+        {
+            if (hauler?.aQueue == null || chains == null || string.IsNullOrEmpty(hauler.strID))
+                return;
+
+            CleanupHauler(hauler);
+
+            foreach (var chain in chains)
+            {
+                if (chain?.Item == null || string.IsNullOrEmpty(chain.Item.strID))
+                    continue;
+
+                Entries.RemoveAll(e => e.HaulerID == hauler.strID && e.ItemID == chain.Item.strID);
+                Entries.Add(new Entry
+                {
+                    HaulerID = hauler.strID,
+                    ItemID = chain.Item.strID,
+                    Pickup = chain.Pickup,
+                    Walk = chain.Walk,
+                    Drop = chain.Drop
+                });
+            }
+        }
+
+        internal static void CleanupHauler(CondOwner hauler)
+        {
+            if (hauler == null || string.IsNullOrEmpty(hauler.strID))
+                return;
+
+            var queue = hauler.aQueue;
+            Entries.RemoveAll(e =>
+                e.HaulerID == hauler.strID
+                && (queue == null
+                    || (!queue.Contains(e.Pickup) && !queue.Contains(e.Walk) && !queue.Contains(e.Drop))));
+        }
+
+        internal static void HandleRemovedTask(Task2 task)
+        {
+            if (task == null || CompletingTaskDepth > 0 || string.IsNullOrEmpty(task.strTargetCOID))
+                return;
+
+            var removed = 0;
+            for (var i = Entries.Count - 1; i >= 0; i--)
+            {
+                var entry = Entries[i];
+                if (entry.ItemID != task.strTargetCOID)
+                    continue;
+
+                if (!TryGetHauler(entry.HaulerID, out var hauler) || hauler.aQueue == null)
+                {
+                    Entries.RemoveAt(i);
+                    continue;
+                }
+
+                var queue = hauler.aQueue;
+                var pickupQueued = queue.Contains(entry.Pickup);
+                if (pickupQueued)
+                {
+                    queue.Remove(entry.Pickup);
+                    queue.Remove(entry.Drop);
+                    queue.Remove(entry.Walk);
+                    removed++;
+                    Plugin.Log.LogInfo("[V2HaulCancelCleanup] hauler=" + SafeCO(hauler)
+                        + " itemID=" + entry.ItemID
+                        + " removedQueuedPickupDrop=True");
+                }
+
+                Entries.RemoveAt(i);
+            }
+
+            if (removed == 0 && Entries.Count > 512)
+                Entries.RemoveAll(e => !TryGetHauler(e.HaulerID, out var hauler) || hauler.aQueue == null);
+        }
+
+        private static bool TryGetHauler(string haulerID, out CondOwner hauler)
+        {
+            hauler = null;
+            if (string.IsNullOrEmpty(haulerID))
+                return false;
+
             try
             {
-                var pa = a.GetPos();
-                var pb = b.GetPos();
-                var dx = pa.x - pb.x;
-                var dy = pa.y - pb.y;
-                return dx * dx + dy * dy;
+                return DataHandler.mapCOs.TryGetValue(haulerID, out hauler) && hauler != null;
             }
             catch
             {
-                return float.MaxValue;
+                return false;
+            }
+        }
+
+        private static string SafeCO(CondOwner co)
+        {
+            if (co == null)
+                return "<null>";
+
+            var name = string.IsNullOrEmpty(co.strNameFriendly) ? co.strName : co.strNameFriendly;
+            return (co.strID ?? "?") + "/" + (name ?? "?");
+        }
+
+        private sealed class Entry
+        {
+            internal string HaulerID;
+            internal string ItemID;
+            internal Interaction Pickup;
+            internal Interaction Walk;
+            internal Interaction Drop;
+        }
+    }
+
+    internal sealed class CarriedContainerPlan
+    {
+        private readonly List<ContainerState> _containers;
+        private readonly HashSet<string> _containerIDs;
+        private int _reservedItems;
+
+        private CarriedContainerPlan(List<ContainerCandidate> candidates, bool dragSlotOccupied)
+        {
+            DragSlotOccupied = dragSlotOccupied;
+            candidates.Sort((a, b) => b.Score.CompareTo(a.Score));
+
+            _containers = new List<ContainerState>();
+            _containerIDs = new HashSet<string>();
+            foreach (var candidate in candidates)
+            {
+                if (candidate?.Owner == null || string.IsNullOrEmpty(candidate.Owner.strID) || !_containerIDs.Add(candidate.Owner.strID))
+                    continue;
+
+                _containers.Add(new ContainerState(candidate.Owner.objContainer, candidate.Source));
+            }
+        }
+
+        internal bool DragSlotOccupied { get; }
+
+        internal string Description
+        {
+            get
+            {
+                var sb = new StringBuilder();
+                sb.Append("containers=").Append(_containers.Count)
+                    .Append(" dragOccupied=").Append(DragSlotOccupied)
+                    .Append(" reserved=").Append(_reservedItems)
+                    .Append(" [");
+
+                for (var i = 0; i < _containers.Count; i++)
+                {
+                    if (i > 0)
+                        sb.Append("; ");
+
+                    sb.Append(_containers[i].Description);
+                }
+
+                sb.Append("]");
+                return sb.ToString();
+            }
+        }
+
+        internal static bool TryCreate(CondOwner hauler, out CarriedContainerPlan plan, out string reason)
+        {
+            plan = null;
+            reason = "other";
+
+            var dragSlotOccupied = VanillaHaulBatcher.GetDragSlotItem(hauler) != null || (hauler?.HasCond("IsDragging") ?? false);
+            var candidates = FindCarriedContainers(hauler);
+            if (candidates.Count == 0)
+            {
+                reason = "no-carried-container";
+                return false;
+            }
+
+            plan = new CarriedContainerPlan(candidates, dragSlotOccupied);
+            reason = "";
+            Plugin.Log.LogInfo("[V2CarryContainers] hauler=" + VanillaHaulBatcherSafeCO(hauler)
+                + " " + plan.Description);
+            return true;
+        }
+
+        internal bool TryAddPlannedContainer(CondOwner item, string source, out string reason)
+        {
+            reason = "other";
+            if (item == null)
+            {
+                reason = "null";
+                return false;
+            }
+
+            if (item.objContainer == null)
+            {
+                reason = "no-container";
+                return false;
+            }
+
+            if (string.IsNullOrEmpty(item.strID))
+            {
+                reason = "no-id";
+                return false;
+            }
+
+            if (_containerIDs.Contains(item.strID))
+            {
+                reason = "already-planned";
+                return false;
+            }
+
+            var container = item.objContainer;
+            if (container.gridLayout == null && !item.HasCond("IsInfiniteContainer"))
+            {
+                reason = "no-grid";
+                return false;
+            }
+
+            _containerIDs.Add(item.strID);
+            _containers.Add(new ContainerState(container, source ?? "planned"));
+            reason = "";
+            return true;
+        }
+
+        internal bool TryReserve(CondOwner item, out string reason)
+        {
+            reason = "other";
+            if (item == null)
+            {
+                reason = "null";
+                return false;
+            }
+
+            var reasons = new List<string>();
+            foreach (var container in _containers)
+            {
+                if (container.TryReserve(item, out var containerReason))
+                {
+                    _reservedItems++;
+                    reason = "";
+                    return true;
+                }
+
+                if (!string.IsNullOrEmpty(containerReason))
+                    reasons.Add(containerReason);
+            }
+
+            reason = ChooseFailureReason(reasons);
+            return false;
+        }
+
+        private static List<ContainerCandidate> FindCarriedContainers(CondOwner hauler)
+        {
+            var candidates = new List<ContainerCandidate>();
+            var seen = new HashSet<string>();
+
+            AddSlotContainers(hauler, candidates, seen);
+            AddContainedContainers(hauler, candidates, seen);
+
+            return candidates;
+        }
+
+        private static void AddSlotContainers(CondOwner hauler, List<ContainerCandidate> candidates, HashSet<string> seen)
+        {
+            try
+            {
+                if (hauler?.compSlots == null)
+                    return;
+
+                foreach (var slot in hauler.compSlots.GetSlotsHeldFirst(true))
+                {
+                    var item = slot?.GetOutermostCO();
+                    AddCandidate(item, "slot:" + (slot?.strName ?? "?"), candidates, seen);
+                }
+
+                AddCandidate(VanillaHaulBatcher.GetDragSlotItem(hauler), "slot:drag", candidates, seen);
+            }
+            catch
+            {
+            }
+        }
+
+        private static void AddContainedContainers(CondOwner hauler, List<ContainerCandidate> candidates, HashSet<string> seen)
+        {
+            try
+            {
+                if (hauler == null)
+                    return;
+
+                foreach (var item in hauler.GetCOsSafe(true, null))
+                    AddCandidate(item, "carried", candidates, seen);
+            }
+            catch
+            {
+            }
+        }
+
+        private static void AddCandidate(CondOwner item, string source, List<ContainerCandidate> candidates, HashSet<string> seen)
+        {
+            if (item?.objContainer == null || item.bDestroyed || string.IsNullOrEmpty(item.strID))
+                return;
+
+            if (item.HasCond("IsInstalled"))
+                return;
+
+            var container = item.objContainer;
+            var hasGrid = container.gridLayout != null;
+            if (!hasGrid && !item.HasCond("IsInfiniteContainer"))
+                return;
+
+            if (!seen.Add(item.strID))
+                return;
+
+            candidates.Add(new ContainerCandidate
+            {
+                Owner = item,
+                Source = source,
+                Score = ContainerScore(item, source)
+            });
+        }
+
+        private static int ContainerScore(CondOwner item, string source)
+        {
+            if (item == null)
+                return int.MinValue;
+
+            var score = 1000;
+            source = source ?? "";
+
+            if (source == "slot:back" || item.HasCond("IsBackpack"))
+                score += 5000;
+
+            if (source == "slot:heldL" || source == "slot:heldR" || source == "slot:handL" || source == "slot:handR")
+                score += 4000;
+
+            if (source == "slot:drag")
+                score += 3000;
+
+            var text = ((item.strNameFriendly ?? "") + " " + (item.strName ?? "") + " " + (item.strCODef ?? "")).ToLowerInvariant();
+            if (text.Contains("backpack") || text.Contains("kompart"))
+                score += 2000;
+
+            if (text.Contains("crate") || text.Contains("dolly") || text.Contains("cart"))
+                score += 1000;
+
+            if (item.objContainer?.gridLayout != null)
+                score += Math.Max(0, item.objContainer.gridLayout.gridMaxX * item.objContainer.gridLayout.gridMaxY);
+
+            return score;
+        }
+
+        private static string ChooseFailureReason(List<string> reasons)
+        {
+            if (reasons == null || reasons.Count == 0)
+                return "no-container-fit";
+
+            if (reasons.Contains("no-grid-room"))
+                return "no-grid-room";
+
+            if (reasons.Contains("too-large"))
+                return "too-large";
+
+            if (reasons.Contains("container-reject"))
+                return "container-reject";
+
+            return reasons[0];
+        }
+
+        private static string StackKey(CondOwner item)
+        {
+            return item.strCODef
+                ?? item.strItemDef
+                ?? item.strName
+                ?? item.strNameFriendly
+                ?? item.strID
+                ?? "";
+        }
+
+        private static Dictionary<string, List<int>> CloneStacks(Dictionary<string, List<int>> source)
+        {
+            var clone = new Dictionary<string, List<int>>();
+            foreach (var kvp in source)
+                clone[kvp.Key] = new List<int>(kvp.Value);
+
+            return clone;
+        }
+
+        private static bool CanPlace(bool[,] grid, int x, int y, int width, int height)
+        {
+            for (var yy = y; yy < y + height; yy++)
+            {
+                for (var xx = x; xx < x + width; xx++)
+                {
+                    if (grid[xx, yy])
+                        return false;
+                }
+            }
+
+            return true;
+        }
+
+        private static void MarkPlaced(bool[,] grid, int x, int y, int width, int height)
+        {
+            for (var yy = y; yy < y + height; yy++)
+            {
+                for (var xx = x; xx < x + width; xx++)
+                    grid[xx, yy] = true;
+            }
+        }
+
+        private static string VanillaHaulBatcherSafeCO(CondOwner co)
+        {
+            if (co == null)
+                return "<null>";
+
+            var name = string.IsNullOrEmpty(co.strNameFriendly) ? co.strName : co.strNameFriendly;
+            return (co.strID ?? "?") + "/" + (name ?? "?");
+        }
+
+        private sealed class ContainerCandidate
+        {
+            internal CondOwner Owner;
+            internal string Source;
+            internal int Score;
+        }
+
+        private sealed class ContainerState
+        {
+            private readonly Container _container;
+            private readonly string _source;
+            private bool[,] _occupied;
+            private Dictionary<string, List<int>> _stackCounts;
+            private readonly int _width;
+            private readonly int _height;
+            private int _reservedItems;
+
+            internal ContainerState(Container container, string source)
+            {
+                _container = container;
+                _source = source ?? "?";
+
+                var grid = container.gridLayout;
+                _width = Math.Max(0, grid?.gridMaxX ?? 0);
+                _height = Math.Max(0, grid?.gridMaxY ?? 0);
+                _occupied = new bool[_width, _height];
+                _stackCounts = new Dictionary<string, List<int>>();
+
+                if (grid?.gridID != null)
+                {
+                    for (var x = 0; x < _width; x++)
+                    {
+                        for (var y = 0; y < _height; y++)
+                        {
+                            _occupied[x, y] = !string.IsNullOrEmpty(grid.gridID[x, y]);
+                        }
+                    }
+                }
+
+                SeedDirectStacks();
+            }
+
+            internal string Description
+            {
+                get
+                {
+                    return _source + ":" + VanillaHaulBatcherSafeCO(_container?.CO)
+                        + " grid=" + _width + "x" + _height
+                        + " freeCells=" + CountFreeCells()
+                        + " reserved=" + _reservedItems;
+                }
+            }
+
+            internal bool TryReserve(CondOwner item, out string reason)
+            {
+                reason = "other";
+                if (item == null)
+                {
+                    reason = "null";
+                    return false;
+                }
+
+                if (_container?.CO == null)
+                {
+                    reason = "no-container";
+                    return false;
+                }
+
+                try
+                {
+                    if (_container.ctAllowed != null && !_container.ctAllowed.Triggered(item))
+                    {
+                        reason = "container-reject";
+                        return false;
+                    }
+                }
+                catch
+                {
+                    reason = "container-test-failed";
+                    return false;
+                }
+
+                if (_container.CO.HasCond("IsInfiniteContainer"))
+                {
+                    _reservedItems++;
+                    reason = "";
+                    return true;
+                }
+
+                var testGrid = (bool[,])_occupied.Clone();
+                var testStacks = CloneStacks(_stackCounts);
+                var remaining = Math.Max(1, item.StackCount);
+                var stackLimit = Math.Max(1, item.nStackLimit);
+
+                if (_container.bAllowStacking && stackLimit > 1)
+                {
+                    var key = StackKey(item);
+                    if (!testStacks.TryGetValue(key, out var counts))
+                    {
+                        counts = new List<int>();
+                        testStacks[key] = counts;
+                    }
+
+                    for (var i = 0; i < counts.Count && remaining > 0; i++)
+                    {
+                        var free = Math.Max(0, stackLimit - counts[i]);
+                        var take = Math.Min(free, remaining);
+                        counts[i] += take;
+                        remaining -= take;
+                    }
+
+                    while (remaining > 0)
+                    {
+                        if (!TryPlaceItemShape(item, testGrid, out reason))
+                            return false;
+
+                        var take = Math.Min(stackLimit, remaining);
+                        counts.Add(take);
+                        remaining -= take;
+                    }
+                }
+                else
+                {
+                    for (var i = 0; i < remaining; i++)
+                    {
+                        if (!TryPlaceItemShape(item, testGrid, out reason))
+                            return false;
+                    }
+                }
+
+                _occupied = testGrid;
+                _stackCounts = testStacks;
+                _reservedItems++;
+                reason = "";
+                return true;
+            }
+
+            private void SeedDirectStacks()
+            {
+                var owner = _container?.CO;
+                if (owner == null)
+                    return;
+
+                List<CondOwner> contents;
+                try
+                {
+                    contents = owner.GetCOsSafe(true, null);
+                }
+                catch
+                {
+                    return;
+                }
+
+                foreach (var item in contents)
+                {
+                    if (item == null
+                        || item.bDestroyed
+                        || item.coStackHead != null
+                        || item.objCOParent != owner
+                        || item.nStackLimit <= 1)
+                    {
+                        continue;
+                    }
+
+                    var key = StackKey(item);
+                    if (!_stackCounts.TryGetValue(key, out var counts))
+                    {
+                        counts = new List<int>();
+                        _stackCounts[key] = counts;
+                    }
+
+                    counts.Add(Math.Max(1, item.StackCount));
+                }
+            }
+
+            private bool TryPlaceItemShape(CondOwner item, bool[,] grid, out string reason)
+            {
+                reason = "shape";
+                if (item == null || _width <= 0 || _height <= 0)
+                    return false;
+
+                var size = GUIInventoryItem.GetWidthHeightForCO(item);
+                var itemWidth = Math.Max(1, size.x);
+                var itemHeight = Math.Max(1, size.y);
+
+                if (itemWidth > _width || itemHeight > _height)
+                {
+                    reason = "too-large";
+                    return false;
+                }
+
+                for (var y = 0; y <= _height - itemHeight; y++)
+                {
+                    for (var x = 0; x <= _width - itemWidth; x++)
+                    {
+                        if (!CanPlace(grid, x, y, itemWidth, itemHeight))
+                            continue;
+
+                        MarkPlaced(grid, x, y, itemWidth, itemHeight);
+                        reason = "";
+                        return true;
+                    }
+                }
+
+                reason = "no-grid-room";
+                return false;
+            }
+
+            private int CountFreeCells()
+            {
+                var free = 0;
+                for (var x = 0; x < _width; x++)
+                {
+                    for (var y = 0; y < _height; y++)
+                    {
+                        if (!_occupied[x, y])
+                            free++;
+                    }
+                }
+
+                return free;
+            }
+        }
+    }
+
+    [HarmonyPatch(typeof(WorkManager), nameof(WorkManager.CompleteTask), new Type[] { typeof(string), typeof(string), typeof(string) })]
+    internal static class CompleteTaskPatch
+    {
+        private static void Prefix()
+        {
+            HaulBatchRegistry.BeginCompleteTask();
+        }
+
+        private static void Finalizer()
+        {
+            HaulBatchRegistry.EndCompleteTask();
+        }
+    }
+
+    [HarmonyPatch(typeof(WorkManager), nameof(WorkManager.RemoveTask), new Type[] { typeof(Task2) })]
+    internal static class RemoveTaskPatch
+    {
+        private static void Prefix(Task2 task)
+        {
+            try
+            {
+                HaulBatchRegistry.HandleRemovedTask(task);
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError("[V2HaulCancelCleanup] failed: " + ex);
             }
         }
     }
@@ -1239,48 +1856,12 @@ namespace OstranautsSmartHaulingFresh
         {
             try
             {
-                SimpleHaulBatcher.TryCompactVanillaHaulQueue(__instance);
+                VanillaHaulBatcher.TryCompact(__instance);
             }
             catch (Exception ex)
             {
-                Plugin.Log.LogError("[SimpleHaulBatch] failed: " + ex);
+                Plugin.Log.LogError("[V2HaulBatch] failed: " + ex);
             }
-        }
-    }
-
-    [HarmonyPatch(typeof(CondOwner), "QueueInteraction")]
-    internal static class QueueInteractionPatch
-    {
-        private static void Postfix(CondOwner __instance, Interaction objInteraction, bool bInsert, bool __result)
-        {
-            if (!__result)
-                return;
-
-            try
-            {
-                if (IsDragInteraction(objInteraction))
-                {
-                    Plugin.Log.LogInfo("[DragProbeQueued] hauler=" + ItemDiagnostics.SafeCO(__instance)
-                        + " interaction=" + (objInteraction?.strName ?? "?")
-                        + " insert=" + bInsert
-                        + " item={" + ItemDiagnostics.DescribeCarryState(__instance, objInteraction?.objThem) + "}");
-                }
-
-                BuildMaterialFetchBatcher.TryBatchQueuedMaterialFetches(__instance, objInteraction, bInsert);
-            }
-            catch (Exception ex)
-            {
-                Plugin.Log.LogError("[BuildFetchBatch] failed: " + ex);
-            }
-        }
-
-        private static bool IsDragInteraction(Interaction interaction)
-        {
-            return interaction != null
-                && (string.Equals(interaction.strName, "PickupDragStart", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(interaction.strName, "PickupDragStop", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(interaction.strName, "DropCorpse", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(interaction.strName, "JettisonCorpse", StringComparison.OrdinalIgnoreCase));
         }
     }
 }

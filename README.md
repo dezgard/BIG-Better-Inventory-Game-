@@ -2,28 +2,37 @@
 
 By Dezgard
 
-Simple Smart Hauling reduces one-item hauling and building trips without replacing Ostranauts' normal job system.
+Simple Smart Hauling reduces one-item hauling trips without replacing Ostranauts' normal job system.
 
-The game still creates the haul jobs, haul icons, pickup actions, drop actions, and task cleanup. This mod waits for those vanilla jobs, then compacts safe inventory-haul jobs so the crew member can pick up more loose inventory items before walking back to unload.
+The game still creates the haul jobs, haul icons, pickup actions, drop actions, and task cleanup. This mod waits for those vanilla jobs, then compacts safe haul work so the crew member can collect more items before walking back to unload.
 
-Drag-style and bulky items are intentionally left to the base game. That means crates, walls, hull pieces, doors, pumps, regulators, coolers, canisters, bottles, containers, oversized items, and cumbersome items are skipped by the smart batcher and handled later by vanilla hauling. The goal is to speed up normal loose item hauling while avoiding the broken behavior caused by trying to drag several bulky objects at once.
+Version 0.8.5 uses the rebuilt V2 hauling planner. It checks real container space from backpacks, hand-held containers, carried containers, and dragged containers.
 
-For building and installing, the mod also lets crew grab extra matching loose materials before feeding the first construction job. This reduces repeated trips when placing compatible stackable materials such as floors.
+If a marked crate, dolly, or storage container can help carry the job, the mod can grab it first. It then keeps collecting loose items if that container has room.
 
-The latest version also adds a stronger inventory capacity check. Crew should stop adding extra pickup jobs once their current carry plan is full, unload what they have, then continue on later work passes instead of trying to grab items that no longer fit.
+Drag-heavy hauling is handled conservatively. Loose inventory items are picked first. Drag items are kept to one helper container or one normal dragged item when possible.
 
 ## Features
 
-- Uses the game's normal haul marking and work system.
-- Keeps vanilla haul icons and vanilla task cleanup.
-- Batches safe loose inventory items into fewer trips.
-- Skips drag/bulky items so vanilla handles them normally later.
-- Supports mixed safe inventory items going to the same ship.
-- Keeps each item's own vanilla drop action, so storage zones can still choose their own drop tiles.
-- Adds build/install material fetching for compatible loose materials.
-- Adds basic dolly-aware construction fetching when a dragged dolly can hold the material.
-- Hauling batch limit: 200 tasks per pass, still limited by inventory capacity.
-- Building material fetch limit: 200 extra items per pass, still limited by stack/carry checks.
+- Uses vanilla haul jobs.
+- Keeps vanilla haul icons.
+- Keeps vanilla task cleanup.
+- Batches loose inventory items.
+- Uses real container space.
+- Uses backpack storage.
+- Uses hand-held containers.
+- Uses carried containers.
+- Uses dragged container storage.
+- Picks loose items first.
+- Can grab a helper crate first.
+- Can fill a helper container.
+- Can include one drag item.
+- Avoids multiple drag items.
+- Sorts pickups by path.
+- Stops when storage is full.
+- Keeps vanilla drop actions.
+- Supports mixed haul items.
+- Limits hauling to 200 tasks per pass.
 
 ## Requirements
 
@@ -34,18 +43,19 @@ The latest version also adds a stronger inventory capacity check. Crew should st
 ## Install
 
 1. Install BepInEx 5 for Ostranauts.
-2. Put `OstranautsSmartHaulingFresh.dll` in:
+2. Remove old `OstranautsSmartHaulingFresh.dll` versions if present.
+3. Put `OstranautsHaulingV2.dll` in:
 
 ```text
 Ostranauts\BepInEx\plugins\
 ```
 
-3. Restart the game.
+4. Restart the game.
 
 When loaded, the BepInEx log should show:
 
 ```text
-Ostranauts Simple Smart Hauling loaded.
+Ostranauts Hauling V2 0.8.5 loaded.
 ```
 
 ## Build From Source
@@ -59,7 +69,7 @@ dotnet build -c Release
 The built DLL will be in:
 
 ```text
-bin\Release\net472\
+bin\Release\net472\OstranautsHaulingV2.dll
 ```
 
 ## Notes

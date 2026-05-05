@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.8.5
+
+- Switched the release to the V2 hauling plugin.
+- Replaced the old single-backpack planner.
+- Added real multi-container planning.
+- Counts backpack storage.
+- Counts hand-held containers.
+- Counts carried containers.
+- Counts dragged container storage.
+- Can use a marked crate as helper storage.
+- Can use a marked dolly as helper storage.
+- Keeps collecting loose items after grabbing a helper container.
+- Sorts loose pickups with path-aware ordering.
+- Stops planning when storage is full.
+- Keeps vanilla haul icons.
+- Keeps vanilla pickup actions.
+- Keeps vanilla drop actions.
+- Keeps vanilla task cleanup.
+- Released DLL is now `OstranautsHaulingV2.dll`.
+
+## 0.7.0
+
+- Rebased the mod on the stable 0.6.0 hauling/building behavior.
+- Removed the later experimental smart-haul session/unload controller work.
+- Removed LaunchControl dependency usage; this version only requires BepInEx.
+- Kept the safer item filter changes for smart batching.
+- Bottles/flasks are no longer treated as bulky by name alone, so normal inventory bottles can batch when the game says they fit.
+- Containers are no longer blanket-skipped by condition alone; true drag/bulky items are still left to vanilla.
+- Items with non-hand equipment slots are skipped by smart batching to avoid pulling equipped/slot-style items into mass haul batches.
+
 ## 0.6.0
 
 - Raised hauling and build/install batch limits to 200.
