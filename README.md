@@ -6,11 +6,13 @@ Simple Smart Hauling reduces one-item hauling trips without replacing Ostranauts
 
 The game still creates the haul jobs, haul icons, pickup actions, drop actions, and task cleanup. This mod waits for those vanilla jobs, then compacts safe haul work so the crew member can collect more items before walking back to unload.
 
-Version 0.8.5 uses the rebuilt V2 hauling planner. It checks real container space from backpacks, hand-held containers, carried containers, and dragged containers.
+Version 0.8.7 uses the rebuilt V2 hauling planner. It checks real container space from backpacks, hand-held containers, carried containers, and dragged containers.
 
 If a marked crate, dolly, or storage container can help carry the job, the mod can grab it first. It then keeps collecting loose items if that container has room.
 
 Drag-heavy hauling is handled conservatively. Loose inventory items are picked first. Drag items are kept to one helper container or one normal dragged item when possible.
+
+The mod also creates support logs. If something goes wrong, close the game and upload the newest zip from `BepInEx\BIGSupportLogs`.
 
 ## Features
 
@@ -33,6 +35,9 @@ Drag-heavy hauling is handled conservatively. Loose inventory items are picked f
 - Keeps vanilla drop actions.
 - Supports mixed haul items.
 - Limits hauling to 200 tasks per pass.
+- Creates support log zips.
+- Lists installed BepInEx plugins.
+- Lists disabled plugin files.
 
 ## Requirements
 
@@ -55,8 +60,28 @@ Ostranauts\BepInEx\plugins\
 When loaded, the BepInEx log should show:
 
 ```text
-Ostranauts Hauling V2 0.8.5 loaded.
+Ostranauts Hauling V2 0.8.7 loaded.
 ```
+
+## Support Logs
+
+Support logs are written to:
+
+```text
+Ostranauts\BepInEx\BIGSupportLogs\
+```
+
+Each game session creates a dated `BIG-*.log` and a matching `BIG-*.zip`.
+
+If the game crashes before the zip is created, start the game once more. The mod will zip loose BIG logs on startup.
+
+The zip includes:
+
+- BIG hauling actions.
+- BIG startup and shutdown info.
+- Loaded BepInEx plugins.
+- BepInEx dependency errors.
+- Raw files in `BepInEx\plugins`.
 
 ## Build From Source
 

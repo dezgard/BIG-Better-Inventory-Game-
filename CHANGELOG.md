@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.8.7
+
+- Added a mod snapshot to BIG support logs.
+- Logged loaded BepInEx plugin GUIDs, names, versions, and DLL locations.
+- Logged BepInEx dependency errors.
+- Logged raw files in `BepInEx\plugins`, including disabled or renamed DLL files.
+- No intended hauling behavior changes.
+
+## 0.8.6
+
+- Added built-in BIG support logging.
+- Copied normal BIG hauling action logs into a dated support log.
+- Added dated support zip creation on clean game shutdown.
+- Added startup zipping for loose logs left behind after crashes.
+- No intended hauling behavior changes.
+
 ## 0.8.5
 
 - Rebuilt the public release around the newer V2 hauling planner.

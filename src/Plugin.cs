@@ -1,30 +1,323 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.IO.Compression;
+using System.Linq;
+using System.Reflection;
 using System.Text;
 using BepInEx;
+using BepInEx.Bootstrap;
 using BepInEx.Logging;
 using HarmonyLib;
 using Ostranauts.Inventory;
 
 namespace OstranautsHaulingV2
 {
-    [BepInPlugin("com.dezgard.ostranauts.haulingv2", "Ostranauts Hauling V2", "0.8.5")]
+    internal static class BigSupportLog
+    {
+        private static readonly object Sync = new object();
+        private static string _logDir;
+        private static string _sessionLogPath;
+        private static bool _initialized;
+
+        internal static string ZipPath { get; private set; }
+
+        internal static void Init(string pluginVersion)
+        {
+            lock (Sync)
+            {
+                if (_initialized)
+                    return;
+
+                _initialized = true;
+                _logDir = Path.Combine(GetBepInExRoot(), "BIGSupportLogs");
+                Directory.CreateDirectory(_logDir);
+                ZipPreviousLooseLogs();
+
+                var stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
+                _sessionLogPath = Path.Combine(_logDir, "BIG-" + stamp + ".log");
+                ZipPath = Path.Combine(_logDir, "BIG-" + stamp + ".zip");
+
+                WriteRaw("=== BIG support log started " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " ===");
+                WriteRaw("Plugin version: " + pluginVersion);
+                WriteRaw("BepInEx root: " + GetBepInExRoot());
+                WriteRaw("Game root: " + SafePath(() => Paths.GameRootPath));
+                WriteRaw("Plugin path: " + Assembly.GetExecutingAssembly().Location);
+                WriteRaw("");
+                WritePluginSnapshot();
+                WriteRaw("");
+            }
+        }
+
+        internal static void ModInfo(string message)
+        {
+            Write("INFO", message);
+        }
+
+        internal static void ModWarn(string message)
+        {
+            Write("WARN", message);
+        }
+
+        internal static void ModError(string message)
+        {
+            Write("ERROR", message);
+        }
+
+        internal static void Shutdown()
+        {
+            lock (Sync)
+            {
+                if (!_initialized || string.IsNullOrEmpty(_sessionLogPath))
+                    return;
+
+                WriteRaw("");
+                WriteRaw("=== BIG support log ended " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " ===");
+                TryZipFile(_sessionLogPath, ZipPath);
+            }
+        }
+
+        private static void Write(string level, string message)
+        {
+            lock (Sync)
+            {
+                if (!_initialized || string.IsNullOrEmpty(_sessionLogPath))
+                    return;
+
+                WriteRaw(DateTime.Now.ToString("HH:mm:ss.fff") + " [" + level + "] " + (message ?? ""));
+            }
+        }
+
+        private static void WriteRaw(string line)
+        {
+            try
+            {
+                File.AppendAllText(_sessionLogPath, line + Environment.NewLine);
+            }
+            catch
+            {
+                // Support logging must never affect hauling behavior.
+            }
+        }
+
+        private static void ZipPreviousLooseLogs()
+        {
+            try
+            {
+                foreach (var logPath in Directory.GetFiles(_logDir, "BIG-*.log"))
+                {
+                    var zipPath = Path.ChangeExtension(logPath, ".zip");
+                    if (File.Exists(zipPath))
+                        continue;
+
+                    TryZipFile(logPath, zipPath);
+                }
+            }
+            catch
+            {
+                // Best effort only.
+            }
+        }
+
+        private static void WritePluginSnapshot()
+        {
+            WriteRaw("=== Installed/loaded plugin snapshot ===");
+
+            try
+            {
+                var infos = Chainloader.PluginInfos;
+                WriteRaw("Loaded BepInEx plugins: " + (infos?.Count ?? 0));
+                if (infos != null)
+                {
+                    foreach (var entry in infos.OrderBy(e => e.Key, StringComparer.OrdinalIgnoreCase))
+                    {
+                        var info = entry.Value;
+                        var metadata = info?.Metadata;
+                        WriteRaw("- " + (metadata?.GUID ?? entry.Key ?? "<unknown>")
+                            + " | " + (metadata?.Name ?? "<unknown>")
+                            + " | " + (metadata?.Version?.ToString() ?? "<unknown>")
+                            + " | " + (info?.Location ?? "<unknown>"));
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                WriteRaw("Loaded BepInEx plugins: failed to read: " + ex.GetType().Name + ": " + ex.Message);
+            }
+
+            try
+            {
+                var errors = Chainloader.DependencyErrors;
+                WriteRaw("BepInEx dependency errors: " + (errors?.Count ?? 0));
+                if (errors != null)
+                {
+                    foreach (var error in errors)
+                        WriteRaw("- " + error);
+                }
+            }
+            catch (Exception ex)
+            {
+                WriteRaw("BepInEx dependency errors: failed to read: " + ex.GetType().Name + ": " + ex.Message);
+            }
+
+            try
+            {
+                var pluginPath = Paths.PluginPath;
+                WriteRaw("Plugin folder files: " + pluginPath);
+                if (Directory.Exists(pluginPath))
+                {
+                    foreach (var file in Directory.GetFiles(pluginPath).OrderBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase))
+                    {
+                        var info = new FileInfo(file);
+                        WriteRaw("- " + info.Name
+                            + " | " + info.Length + " bytes"
+                            + " | modified " + info.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")
+                            + " | " + PluginFileState(info));
+                    }
+                }
+                else
+                {
+                    WriteRaw("- plugin folder not found");
+                }
+            }
+            catch (Exception ex)
+            {
+                WriteRaw("Plugin folder files: failed to read: " + ex.GetType().Name + ": " + ex.Message);
+            }
+        }
+
+        private static string PluginFileState(FileInfo info)
+        {
+            if (info == null)
+                return "unknown";
+
+            if (string.Equals(info.Extension, ".dll", StringComparison.OrdinalIgnoreCase))
+                return "dll-load-candidate";
+
+            if (info.Name.IndexOf(".dll.", StringComparison.OrdinalIgnoreCase) >= 0
+                || info.Name.EndsWith(".dll.txt", StringComparison.OrdinalIgnoreCase))
+                return "disabled-or-renamed-dll";
+
+            return "non-dll-file";
+        }
+
+        private static void TryZipFile(string logPath, string zipPath)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(logPath) || !File.Exists(logPath))
+                    return;
+
+                zipPath = GetAvailableZipPath(zipPath);
+                using (var zipStream = new FileStream(zipPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None))
+                using (var archive = new ZipArchive(zipStream, ZipArchiveMode.Create))
+                {
+                    var entry = archive.CreateEntry(Path.GetFileName(logPath), CompressionLevel.Optimal);
+                    using (var entryStream = entry.Open())
+                    using (var logStream = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                    {
+                        logStream.CopyTo(entryStream);
+                    }
+                }
+            }
+            catch
+            {
+                // Leave the loose log in place if zipping fails.
+            }
+        }
+
+        private static string GetAvailableZipPath(string requestedPath)
+        {
+            if (!File.Exists(requestedPath))
+                return requestedPath;
+
+            var folder = Path.GetDirectoryName(requestedPath);
+            var name = Path.GetFileNameWithoutExtension(requestedPath);
+            var ext = Path.GetExtension(requestedPath);
+
+            for (var i = 2; i < 1000; i++)
+            {
+                var candidate = Path.Combine(folder, name + "-" + i + ext);
+                if (!File.Exists(candidate))
+                    return candidate;
+            }
+
+            return Path.Combine(folder, name + "-" + DateTime.Now.Ticks + ext);
+        }
+
+        private static string GetBepInExRoot()
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(Paths.BepInExRootPath))
+                    return Paths.BepInExRootPath;
+            }
+            catch
+            {
+            }
+
+            var pluginPath = Assembly.GetExecutingAssembly().Location;
+            return Path.GetDirectoryName(Path.GetDirectoryName(pluginPath)) ?? Path.GetDirectoryName(pluginPath) ?? ".";
+        }
+
+        private static string SafePath(Func<string> getter)
+        {
+            try
+            {
+                return getter() ?? "";
+            }
+            catch
+            {
+                return "";
+            }
+        }
+    }
+
+    [BepInPlugin("com.dezgard.ostranauts.haulingv2", "Ostranauts Hauling V2", "0.8.7")]
     public sealed class Plugin : BaseUnityPlugin
     {
+        internal const string PluginVersion = "0.8.7";
         internal static ManualLogSource Log { get; private set; }
         private Harmony _harmony;
 
         private void Awake()
         {
             Log = Logger;
+            BigSupportLog.Init(PluginVersion);
             _harmony = new Harmony("com.dezgard.ostranauts.haulingv2");
             _harmony.PatchAll();
-            Log.LogInfo("Ostranauts Hauling V2 0.8.5 loaded. Utility dragged-container planning continues loose pickup.");
+            ModInfo("Ostranauts Hauling V2 " + PluginVersion + " loaded. Utility dragged-container planning continues loose pickup. Support zip will be written to " + BigSupportLog.ZipPath);
         }
 
         private void OnDestroy()
         {
-            _harmony?.UnpatchSelf();
+            try
+            {
+                ModInfo("Ostranauts Hauling V2 " + PluginVersion + " unloading.");
+                _harmony?.UnpatchSelf();
+            }
+            finally
+            {
+                BigSupportLog.Shutdown();
+            }
+        }
+
+        internal static void ModInfo(string message)
+        {
+            Log?.LogInfo(message);
+            BigSupportLog.ModInfo(message);
+        }
+
+        internal static void ModWarn(string message)
+        {
+            Log?.LogWarning(message);
+            BigSupportLog.ModWarn(message);
+        }
+
+        internal static void ModError(string message)
+        {
+            Log?.LogError(message);
+            BigSupportLog.ModError(message);
         }
     }
 
@@ -58,7 +351,7 @@ namespace OstranautsHaulingV2
 
                 if (!CarriedContainerPlan.TryCreate(hauler, out var carryPlan, out var planReason))
                 {
-                    Plugin.Log.LogInfo("[V2HaulNoCarryPlan] hauler=" + SafeCO(hauler)
+                    Plugin.ModInfo("[V2HaulNoCarryPlan] hauler=" + SafeCO(hauler)
                         + " reason=" + planReason
                         + " item={" + DescribeItem(primary.Item) + "}");
                     return;
@@ -96,7 +389,7 @@ namespace OstranautsHaulingV2
                     if (!TryReadClaimedHaulTask(hauler, task, out var item, out var tile, out var readReason))
                     {
                         workManager.UnclaimTask(task);
-                        Plugin.Log.LogInfo("[V2HaulClaimStop] hauler=" + SafeCO(hauler)
+                        Plugin.ModInfo("[V2HaulClaimStop] hauler=" + SafeCO(hauler)
                             + " reason=" + readReason);
                         break;
                     }
@@ -117,7 +410,7 @@ namespace OstranautsHaulingV2
                     {
                         if (allowUtilityDrag && utilityDragChain == null && TryPlanUtilityDragContainer(hauler, task, item, tile, carryPlan, out utilityDragChain, out var utilityReason))
                         {
-                            Plugin.Log.LogInfo("[V2UtilityDragAdded] hauler=" + SafeCO(hauler)
+                            Plugin.ModInfo("[V2UtilityDragAdded] hauler=" + SafeCO(hauler)
                                 + " reason=" + utilityReason
                                 + " item={" + DescribeItem(item) + "}");
                             if (!string.IsNullOrEmpty(item.strID))
@@ -130,13 +423,13 @@ namespace OstranautsHaulingV2
                             if (!TryQueueVanillaHaulChain(hauler, task, item, tile, out dragChain, out var dragQueueReason))
                             {
                                 workManager.UnclaimTask(task);
-                                Plugin.Log.LogInfo("[V2HaulDragQueueStop] hauler=" + SafeCO(hauler)
+                                Plugin.ModInfo("[V2HaulDragQueueStop] hauler=" + SafeCO(hauler)
                                     + " reason=" + dragQueueReason
                                     + " item={" + DescribeItem(item) + "}");
                                 break;
                             }
 
-                            Plugin.Log.LogInfo("[V2HaulDragAdded] hauler=" + SafeCO(hauler)
+                            Plugin.ModInfo("[V2HaulDragAdded] hauler=" + SafeCO(hauler)
                                 + " reason=" + dragReason
                                 + " item={" + DescribeItem(item) + "}");
                             if (inventoryClosed)
@@ -145,7 +438,7 @@ namespace OstranautsHaulingV2
                         else
                         {
                             skippedTasks.Add(task);
-                            Plugin.Log.LogInfo("[V2HaulSkipForLater] hauler=" + SafeCO(hauler)
+                            Plugin.ModInfo("[V2HaulSkipForLater] hauler=" + SafeCO(hauler)
                                 + " reason=" + itemReason
                                 + " item={" + DescribeItem(item) + "}");
                         }
@@ -157,7 +450,7 @@ namespace OstranautsHaulingV2
                         if (allowUtilityDrag && utilityDragChain == null && TryPlanUtilityDragContainer(hauler, task, item, tile, carryPlan, out utilityDragChain, out var fullUtilityReason))
                         {
                             inventoryClosed = false;
-                            Plugin.Log.LogInfo("[V2UtilityDragAdded] hauler=" + SafeCO(hauler)
+                            Plugin.ModInfo("[V2UtilityDragAdded] hauler=" + SafeCO(hauler)
                                 + " reason=" + fullUtilityReason + "/after-capacity"
                                 + " item={" + DescribeItem(item) + "}");
                             if (!string.IsNullOrEmpty(item.strID))
@@ -170,13 +463,13 @@ namespace OstranautsHaulingV2
                             if (!TryQueueVanillaHaulChain(hauler, task, item, tile, out dragChain, out var fullDragQueueReason))
                             {
                                 workManager.UnclaimTask(task);
-                                Plugin.Log.LogInfo("[V2HaulDragQueueStop] hauler=" + SafeCO(hauler)
+                                Plugin.ModInfo("[V2HaulDragQueueStop] hauler=" + SafeCO(hauler)
                                     + " reason=" + fullDragQueueReason
                                     + " item={" + DescribeItem(item) + "}");
                                 break;
                             }
 
-                            Plugin.Log.LogInfo("[V2HaulDragAdded] hauler=" + SafeCO(hauler)
+                            Plugin.ModInfo("[V2HaulDragAdded] hauler=" + SafeCO(hauler)
                                 + " reason=" + fullDragReason
                                 + " item={" + DescribeItem(item) + "}");
                             break;
@@ -190,7 +483,7 @@ namespace OstranautsHaulingV2
                     {
                         if (allowUtilityDrag && utilityDragChain == null && IsDragReserveStop(reserveReason) && TryPlanUtilityDragContainer(hauler, task, item, tile, carryPlan, out utilityDragChain, out var reserveUtilityReason))
                         {
-                            Plugin.Log.LogInfo("[V2UtilityDragAdded] hauler=" + SafeCO(hauler)
+                            Plugin.ModInfo("[V2UtilityDragAdded] hauler=" + SafeCO(hauler)
                                 + " reason=" + reserveUtilityReason + "/" + reserveReason
                                 + " item={" + DescribeItem(item) + "}");
                             if (!string.IsNullOrEmpty(item.strID))
@@ -203,13 +496,13 @@ namespace OstranautsHaulingV2
                             if (!TryQueueVanillaHaulChain(hauler, task, item, tile, out dragChain, out var dragQueueReason))
                             {
                                 workManager.UnclaimTask(task);
-                                Plugin.Log.LogInfo("[V2HaulDragQueueStop] hauler=" + SafeCO(hauler)
+                                Plugin.ModInfo("[V2HaulDragQueueStop] hauler=" + SafeCO(hauler)
                                     + " reason=" + dragQueueReason
                                     + " item={" + DescribeItem(item) + "}");
                                 break;
                             }
 
-                            Plugin.Log.LogInfo("[V2HaulDragAdded] hauler=" + SafeCO(hauler)
+                            Plugin.ModInfo("[V2HaulDragAdded] hauler=" + SafeCO(hauler)
                                 + " reason=" + reserveDragReason + "/" + reserveReason
                                 + " item={" + DescribeItem(item) + "}");
                             continue;
@@ -219,7 +512,7 @@ namespace OstranautsHaulingV2
                         {
                             inventoryClosed = true;
                             workManager.UnclaimTask(task);
-                            Plugin.Log.LogInfo("[V2HaulCapacityStop] hauler=" + SafeCO(hauler)
+                            Plugin.ModInfo("[V2HaulCapacityStop] hauler=" + SafeCO(hauler)
                                 + " reason=" + reserveReason
                                 + " plannedItems=" + looseChains.Count
                                 + " dragAdded=" + (dragChain != null)
@@ -238,7 +531,7 @@ namespace OstranautsHaulingV2
                     if (!TryQueueVanillaHaulChain(hauler, task, item, tile, out var chain, out var queueReason))
                     {
                         workManager.UnclaimTask(task);
-                        Plugin.Log.LogInfo("[V2HaulQueueStop] hauler=" + SafeCO(hauler)
+                        Plugin.ModInfo("[V2HaulQueueStop] hauler=" + SafeCO(hauler)
                             + " reason=" + queueReason
                             + " item={" + DescribeItem(item) + "}");
                         break;
@@ -271,7 +564,7 @@ namespace OstranautsHaulingV2
 
                 HaulBatchRegistry.Register(hauler, registryChains);
 
-                Plugin.Log.LogInfo("[V2HaulCompacted] hauler=" + SafeCO(hauler)
+                Plugin.ModInfo("[V2HaulCompacted] hauler=" + SafeCO(hauler)
                     + " items=" + chains.Count
                     + " loose=" + looseChains.Count
                     + " drag=" + (utilityDragChain == null && dragChain != null)
@@ -306,7 +599,7 @@ namespace OstranautsHaulingV2
             {
                 if (allowUtilityDrag && utilityDragChain == null && TryPlanPrimaryUtilityDragContainer(hauler, primary, carryPlan, out utilityDragChain, out var utilityReason))
                 {
-                    Plugin.Log.LogInfo("[V2UtilityDragAdded] hauler=" + SafeCO(hauler)
+                    Plugin.ModInfo("[V2UtilityDragAdded] hauler=" + SafeCO(hauler)
                         + " reason=" + utilityReason + "/primary-" + primaryReason
                         + " item={" + DescribeItem(primary.Item) + "}");
                     return true;
@@ -315,13 +608,13 @@ namespace OstranautsHaulingV2
                 if (allowExtraDrag && utilityDragChain == null && dragChain == null && IsOneTripDragCandidate(hauler, primary.Item, out var dragReason))
                 {
                     dragChain = primary;
-                    Plugin.Log.LogInfo("[V2HaulPrimaryDrag] hauler=" + SafeCO(hauler)
+                    Plugin.ModInfo("[V2HaulPrimaryDrag] hauler=" + SafeCO(hauler)
                         + " reason=" + dragReason
                         + " item={" + DescribeItem(primary.Item) + "}");
                     return true;
                 }
 
-                Plugin.Log.LogInfo("[V2HaulVanillaPrimary] hauler=" + SafeCO(hauler)
+                Plugin.ModInfo("[V2HaulVanillaPrimary] hauler=" + SafeCO(hauler)
                     + " reason=" + primaryReason
                     + " item={" + DescribeItem(primary.Item) + "}");
                 return false;
@@ -335,7 +628,7 @@ namespace OstranautsHaulingV2
 
             if (allowUtilityDrag && utilityDragChain == null && IsDragReserveStop(primaryReserveReason) && TryPlanPrimaryUtilityDragContainer(hauler, primary, carryPlan, out utilityDragChain, out var reserveUtilityReason))
             {
-                Plugin.Log.LogInfo("[V2UtilityDragAdded] hauler=" + SafeCO(hauler)
+                Plugin.ModInfo("[V2UtilityDragAdded] hauler=" + SafeCO(hauler)
                     + " reason=" + reserveUtilityReason + "/primary-" + primaryReserveReason
                     + " item={" + DescribeItem(primary.Item) + "}");
                 return true;
@@ -344,13 +637,13 @@ namespace OstranautsHaulingV2
             if (allowExtraDrag && utilityDragChain == null && IsDragReserveStop(primaryReserveReason) && dragChain == null && IsOneTripDragCandidate(hauler, primary.Item, out var reserveDragReason))
             {
                 dragChain = primary;
-                Plugin.Log.LogInfo("[V2HaulPrimaryDrag] hauler=" + SafeCO(hauler)
+                Plugin.ModInfo("[V2HaulPrimaryDrag] hauler=" + SafeCO(hauler)
                     + " reason=" + reserveDragReason + "/" + primaryReserveReason
                     + " item={" + DescribeItem(primary.Item) + "}");
                 return true;
             }
 
-            Plugin.Log.LogInfo("[V2HaulPrimaryNoRoom] hauler=" + SafeCO(hauler)
+            Plugin.ModInfo("[V2HaulPrimaryNoRoom] hauler=" + SafeCO(hauler)
                 + " reason=" + primaryReserveReason
                 + " carry={" + carryPlan.Description + "}"
                 + " item={" + DescribeItem(primary.Item) + "}");
@@ -811,7 +1104,7 @@ namespace OstranautsHaulingV2
             foreach (var target in orderedTargets)
                 chains.Add(target.Chain);
 
-            Plugin.Log.LogInfo("[V2PickupSort] hauler=" + SafeCO(hauler)
+            Plugin.ModInfo("[V2PickupSort] hauler=" + SafeCO(hauler)
                 + " count=" + chains.Count
                 + " changed=" + changed
                 + " pathScores=" + usedPathScores
@@ -1245,7 +1538,7 @@ namespace OstranautsHaulingV2
                     queue.Remove(entry.Drop);
                     queue.Remove(entry.Walk);
                     removed++;
-                    Plugin.Log.LogInfo("[V2HaulCancelCleanup] hauler=" + SafeCO(hauler)
+                    Plugin.ModInfo("[V2HaulCancelCleanup] hauler=" + SafeCO(hauler)
                         + " itemID=" + entry.ItemID
                         + " removedQueuedPickupDrop=True");
                 }
@@ -1354,7 +1647,7 @@ namespace OstranautsHaulingV2
 
             plan = new CarriedContainerPlan(candidates, dragSlotOccupied);
             reason = "";
-            Plugin.Log.LogInfo("[V2CarryContainers] hauler=" + VanillaHaulBatcherSafeCO(hauler)
+            Plugin.ModInfo("[V2CarryContainers] hauler=" + VanillaHaulBatcherSafeCO(hauler)
                 + " " + plan.Description);
             return true;
         }
@@ -1844,7 +2137,7 @@ namespace OstranautsHaulingV2
             }
             catch (Exception ex)
             {
-                Plugin.Log.LogError("[V2HaulCancelCleanup] failed: " + ex);
+                Plugin.ModError("[V2HaulCancelCleanup] failed: " + ex);
             }
         }
     }
@@ -1860,7 +2153,7 @@ namespace OstranautsHaulingV2
             }
             catch (Exception ex)
             {
-                Plugin.Log.LogError("[V2HaulBatch] failed: " + ex);
+                Plugin.ModError("[V2HaulBatch] failed: " + ex);
             }
         }
     }
