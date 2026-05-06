@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.8
+
+- Fixed stackable asteroid ore and regolith being allowed into drag hauling.
+- Stackable non-bulky inventory items now stay on the normal inventory pickup path.
+- Kept crates, dollies, furniture, and other bulky items on the existing drag path.
+- No install changes from 0.8.7.
+
 ## 0.8.7
 
 - Added a mod snapshot to BIG support logs.

@@ -273,10 +273,10 @@ namespace OstranautsHaulingV2
         }
     }
 
-    [BepInPlugin("com.dezgard.ostranauts.haulingv2", "Ostranauts Hauling V2", "0.8.7")]
+    [BepInPlugin("com.dezgard.ostranauts.haulingv2", "Ostranauts Hauling V2", "0.8.8")]
     public sealed class Plugin : BaseUnityPlugin
     {
-        internal const string PluginVersion = "0.8.7";
+        internal const string PluginVersion = "0.8.8";
         internal static ManualLogSource Log { get; private set; }
         private Harmony _harmony;
 
@@ -952,6 +952,12 @@ namespace OstranautsHaulingV2
                 return false;
             }
 
+            if (IsStackableInventoryItem(item))
+            {
+                reason = "stackable-inventory";
+                return false;
+            }
+
             if (CanTrigger(hauler, item, "PickupDragStart"))
             {
                 reason = "dragstart";
@@ -971,6 +977,30 @@ namespace OstranautsHaulingV2
         private static bool IsDragReserveStop(string reason)
         {
             return reason == "container-reject" || reason == "too-large";
+        }
+
+        private static bool IsStackableInventoryItem(CondOwner item)
+        {
+            try
+            {
+                if (item == null || item.Item == null)
+                    return false;
+
+                if (item.nStackLimit <= 1)
+                    return false;
+
+                if (item.objContainer != null)
+                    return false;
+
+                if (item.HasCond("IsCumbersome") || item.HasCond("IsOversized"))
+                    return false;
+
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private static bool HasDragSlot(CondOwner item)
