@@ -273,10 +273,10 @@ namespace OstranautsHaulingV2
         }
     }
 
-    [BepInPlugin("com.dezgard.ostranauts.haulingv2", "Ostranauts Hauling V2", "0.8.8")]
+    [BepInPlugin("com.dezgard.ostranauts.haulingv2", "Ostranauts Hauling V2", "0.8.9")]
     public sealed class Plugin : BaseUnityPlugin
     {
-        internal const string PluginVersion = "0.8.8";
+        internal const string PluginVersion = "0.8.9";
         internal static ManualLogSource Log { get; private set; }
         private Harmony _harmony;
 
@@ -286,7 +286,7 @@ namespace OstranautsHaulingV2
             BigSupportLog.Init(PluginVersion);
             _harmony = new Harmony("com.dezgard.ostranauts.haulingv2");
             _harmony.PatchAll();
-            ModInfo("Ostranauts Hauling V2 " + PluginVersion + " loaded. Utility dragged-container planning continues loose pickup. Support zip will be written to " + BigSupportLog.ZipPath);
+            ModInfo("Ostranauts Hauling V2 " + PluginVersion + " loaded. Smart drop-zone planning prefers good stacks and open stockpile space. Support zip will be written to " + BigSupportLog.ZipPath);
         }
 
         private void OnDestroy()
@@ -365,6 +365,14 @@ namespace OstranautsHaulingV2
                 if (string.IsNullOrEmpty(destinationShipID))
                     return;
 
+                var dropPlan = new DropDestinationPlanner(hauler);
+                if (!dropPlan.TryRetargetExistingChain(primary, out var primaryDropReason))
+                {
+                    Plugin.ModInfo("[V2DropPlanFallback] hauler=" + SafeCO(hauler)
+                        + " reason=" + primaryDropReason
+                        + " item={" + DescribeItem(primary.Item) + "}");
+                }
+
                 var looseChains = new List<HaulChain>();
                 HaulChain utilityDragChain = null;
                 HaulChain dragChain = null;
@@ -386,7 +394,7 @@ namespace OstranautsHaulingV2
                     if (task == null)
                         break;
 
-                    if (!TryReadClaimedHaulTask(hauler, task, out var item, out var tile, out var readReason))
+                    if (!TryReadClaimedHaulTask(hauler, task, dropPlan, out var item, out var tile, out var readReason))
                     {
                         workManager.UnclaimTask(task);
                         Plugin.ModInfo("[V2HaulClaimStop] hauler=" + SafeCO(hauler)
@@ -676,7 +684,7 @@ namespace OstranautsHaulingV2
             return true;
         }
 
-        private static bool TryReadClaimedHaulTask(CondOwner hauler, Task2 task, out CondOwner item, out Tile tile, out string reason)
+        private static bool TryReadClaimedHaulTask(CondOwner hauler, Task2 task, DropDestinationPlanner dropPlan, out CondOwner item, out Tile tile, out string reason)
         {
             item = null;
             tile = null;
@@ -707,7 +715,7 @@ namespace OstranautsHaulingV2
                 return false;
             }
 
-            tile = ResolveHaulDestination(hauler, task, item);
+            tile = ResolveHaulDestination(hauler, task, item, dropPlan);
             if (tile?.coProps == null || string.IsNullOrEmpty(task.strTileShip))
             {
                 reason = "no-destination";
@@ -1045,10 +1053,19 @@ namespace OstranautsHaulingV2
             }
         }
 
-        private static Tile ResolveHaulDestination(CondOwner hauler, Task2 task, CondOwner item)
+        private static Tile ResolveHaulDestination(CondOwner hauler, Task2 task, CondOwner item, DropDestinationPlanner dropPlan)
         {
             if (hauler == null || task == null || item == null)
                 return null;
+
+            if (dropPlan != null && dropPlan.TryResolveForTask(task, item, out var plannedTile, out var planReason))
+            {
+                Plugin.ModInfo("[V2DropPlan] hauler=" + SafeCO(hauler)
+                    + " reason=" + planReason
+                    + " dest=" + DescribeTile(plannedTile)
+                    + " item={" + DescribeItem(item) + "}");
+                return plannedTile;
+            }
 
             Tile tile = null;
             Ship targetShip = null;
@@ -1056,16 +1073,24 @@ namespace OstranautsHaulingV2
 
             if (targetShip != null)
             {
-                if (targetShip.aTiles.Count > task.nTile)
+                if (task.nTile >= 0 && targetShip.aTiles.Count > task.nTile)
                 {
                     tile = targetShip.aTiles[task.nTile];
                 }
                 else if (CrewSim.objInstance?.workManager?.HaulZone(hauler, task, item) != null)
                 {
                     CrewSim.system.dictShips.TryGetValue(task.strTileShip, out targetShip);
-                    if (targetShip != null && targetShip.aTiles.Count > task.nTile)
+                    if (targetShip != null && task.nTile >= 0 && targetShip.aTiles.Count > task.nTile)
                         tile = targetShip.aTiles[task.nTile];
                 }
+            }
+
+            if (tile != null)
+            {
+                Plugin.ModInfo("[V2DropPlan] hauler=" + SafeCO(hauler)
+                    + " reason=vanilla-fallback"
+                    + " dest=" + DescribeTile(tile)
+                    + " item={" + DescribeItem(item) + "}");
             }
 
             return tile;
@@ -1448,6 +1473,24 @@ namespace OstranautsHaulingV2
                 + " installed=" + item.HasCond("IsInstalled");
         }
 
+        private static string DescribeTile(Tile tile)
+        {
+            if (tile == null)
+                return "<null>";
+
+            return (tile.coProps?.ship?.strRegID ?? tile.coProps?.strID ?? "?") + "#" + tile.Index;
+        }
+
+        private static string StackKey(CondOwner item)
+        {
+            return item?.strCODef
+                ?? item?.strItemDef
+                ?? item?.strName
+                ?? item?.strNameFriendly
+                ?? item?.strID
+                ?? "";
+        }
+
         private static string SafeCO(CondOwner co)
         {
             if (co == null)
@@ -1455,6 +1498,533 @@ namespace OstranautsHaulingV2
 
             var name = string.IsNullOrEmpty(co.strNameFriendly) ? co.strName : co.strNameFriendly;
             return (co.strID ?? "?") + "/" + (name ?? "?");
+        }
+
+        private sealed class DropDestinationPlanner
+        {
+            private readonly CondOwner _hauler;
+            private readonly Dictionary<string, int> _reservedStackCounts = new Dictionary<string, int>();
+            private readonly Dictionary<string, List<PlannedStack>> _plannedStacks = new Dictionary<string, List<PlannedStack>>();
+            private readonly HashSet<string> _reservedNewTileKeys = new HashSet<string>();
+
+            internal DropDestinationPlanner(CondOwner hauler)
+            {
+                _hauler = hauler;
+            }
+
+            internal bool TryRetargetExistingChain(HaulChain chain, out string reason)
+            {
+                reason = "other";
+                if (chain?.Walk == null || chain.Item == null)
+                {
+                    reason = "no-chain";
+                    return false;
+                }
+
+                if (!TryChooseDestination(chain.Item, out var tile, out reason))
+                    return false;
+
+                ApplyWalkDestination(chain.Walk, tile);
+                Plugin.ModInfo("[V2DropPlan] hauler=" + SafeCO(_hauler)
+                    + " reason=" + reason + "/primary"
+                    + " dest=" + DescribeTile(tile)
+                    + " item={" + DescribeItem(chain.Item) + "}");
+                return true;
+            }
+
+            internal bool TryResolveForTask(Task2 task, CondOwner item, out Tile tile, out string reason)
+            {
+                tile = null;
+                reason = "other";
+                if (task == null || item == null)
+                {
+                    reason = "null";
+                    return false;
+                }
+
+                if (!TryChooseDestination(item, out tile, out reason))
+                    return false;
+
+                ApplyTaskDestination(task, tile);
+                return true;
+            }
+
+            private bool TryChooseDestination(CondOwner item, out Tile tile, out string reason)
+            {
+                tile = null;
+                reason = "other";
+                if (_hauler == null || item == null || item.Item == null)
+                {
+                    reason = "null";
+                    return false;
+                }
+
+                var zones = GetCompatibleZones(item, out reason);
+                if (zones.Count == 0)
+                    return false;
+
+                var candidates = new List<DropCandidate>();
+                AddPlannedStackCandidates(item, zones, candidates);
+
+                foreach (var zone in zones)
+                {
+                    AddExistingStackCandidates(item, zone, candidates);
+                    AddEmptyFitCandidate(item, zone, candidates);
+                }
+
+                if (candidates.Count == 0)
+                {
+                    reason = "no-custom-drop-candidate";
+                    return false;
+                }
+
+                candidates.Sort(CompareDropCandidates);
+                var selected = candidates[0];
+                Reserve(selected, item);
+
+                tile = selected.Tile;
+                reason = selected.Reason;
+                return tile != null;
+            }
+
+            private List<DropZone> GetCompatibleZones(CondOwner item, out string reason)
+            {
+                reason = "other";
+                var result = new List<DropZone>();
+                if (_hauler?.ship == null || item == null)
+                {
+                    reason = "null";
+                    return result;
+                }
+
+                List<JsonZone> zones;
+                try
+                {
+                    zones = _hauler.ship.GetZones("IsZoneStockpile", _hauler, bAllowDocked: true);
+                    zones?.Sort();
+                }
+                catch (Exception ex)
+                {
+                    reason = "get-zones-" + ex.GetType().Name;
+                    return result;
+                }
+
+                if (zones == null || zones.Count == 0)
+                {
+                    reason = "no-stockpile-zones";
+                    return result;
+                }
+
+                var validHaulDest = DataHandler.GetCondTrigger("TIsValidHaulDest");
+                for (var i = 0; i < zones.Count; i++)
+                {
+                    var zone = zones[i];
+                    if (zone == null || !ZoneAcceptsItem(zone, item))
+                        continue;
+
+                    if (string.IsNullOrEmpty(zone.strRegID) || !CrewSim.system.dictShips.TryGetValue(zone.strRegID, out var ship) || ship == null)
+                        continue;
+
+                    var zoneInfo = new DropZone
+                    {
+                        Zone = zone,
+                        Ship = ship,
+                        OriginalIndex = i,
+                        ZoneName = zone.strName ?? "?",
+                        ZoneKey = (zone.strRegID ?? "?") + ":" + (zone.strName ?? i.ToString()),
+                        TileCount = zone.aTiles?.Length ?? 0
+                    };
+
+                    zoneInfo.Objects = GetZoneObjects(ship, zone, validHaulDest);
+                    zoneInfo.ObjectCount = zoneInfo.Objects.Count;
+                    zoneInfo.ReservedNewTiles = CountReservedTiles(ship, zone);
+                    zoneInfo.FreeScore = Math.Max(0, zoneInfo.TileCount - zoneInfo.ObjectCount - zoneInfo.ReservedNewTiles);
+                    zoneInfo.CanFitEmpty = TryFindEmptyFit(item, zoneInfo, out zoneInfo.EmptyTile);
+
+                    result.Add(zoneInfo);
+                }
+
+                reason = result.Count == 0 ? "no-compatible-zones" : "";
+                return result;
+            }
+
+            private void AddExistingStackCandidates(CondOwner item, DropZone zone, List<DropCandidate> candidates)
+            {
+                if (zone?.Objects == null || candidates == null)
+                    return;
+
+                var needed = Math.Max(1, item?.StackCount ?? 1);
+                var seenStacks = new HashSet<string>();
+                foreach (var obj in zone.Objects)
+                {
+                    var stack = obj?.coStackHead ?? obj;
+                    if (stack == null || string.IsNullOrEmpty(stack.strID) || !seenStacks.Add(stack.strID))
+                        continue;
+
+                    var capacity = SafeStackCapacity(stack, item) - GetReservedStackCount(stack);
+                    if (capacity < needed)
+                        continue;
+
+                    var stackTile = GetTileForCO(zone.Ship, stack);
+                    if (stackTile?.coProps == null)
+                        continue;
+
+                    var score = zone.CanFitEmpty ? 300000 : 120000;
+                    score += Math.Min(zone.FreeScore, 5000) * 50;
+                    score += Math.Min(Math.Max(0, stack.StackCount), 1000) * 5;
+                    score += Math.Min(capacity, 1000) * 2;
+
+                    candidates.Add(new DropCandidate
+                    {
+                        Tile = stackTile,
+                        Score = score,
+                        Distance = TileRangeSafe(GetCurrentTile(_hauler), stackTile),
+                        OriginalZoneIndex = zone.OriginalIndex,
+                        Reason = "existing-stack zone=" + zone.ZoneName
+                            + " cap=" + capacity
+                            + " free=" + zone.FreeScore
+                            + " crowded=" + (!zone.CanFitEmpty),
+                        ExistingStack = stack
+                    });
+                }
+            }
+
+            private void AddPlannedStackCandidates(CondOwner item, List<DropZone> zones, List<DropCandidate> candidates)
+            {
+                if (item == null || candidates == null || item.nStackLimit <= 1)
+                    return;
+
+                var key = StackKey(item);
+                if (string.IsNullOrEmpty(key) || !_plannedStacks.TryGetValue(key, out var stacks))
+                    return;
+
+                var needed = Math.Max(1, item.StackCount);
+                foreach (var planned in stacks)
+                {
+                    if (planned == null || planned.FreeCapacity < needed || planned.Tile?.coProps == null)
+                        continue;
+
+                    var zone = zones.FirstOrDefault(z => z.ZoneKey == planned.ZoneKey);
+                    var free = zone?.FreeScore ?? 0;
+                    var score = 280000 + Math.Min(free, 5000) * 50 + Math.Min(planned.FreeCapacity, 1000) * 2;
+                    candidates.Add(new DropCandidate
+                    {
+                        Tile = planned.Tile,
+                        Score = score,
+                        Distance = TileRangeSafe(GetCurrentTile(_hauler), planned.Tile),
+                        OriginalZoneIndex = zone?.OriginalIndex ?? int.MaxValue,
+                        Reason = "planned-stack zone=" + (zone?.ZoneName ?? planned.ZoneKey)
+                            + " cap=" + planned.FreeCapacity
+                            + " free=" + free,
+                        PlannedStack = planned
+                    });
+                }
+            }
+
+            private void AddEmptyFitCandidate(CondOwner item, DropZone zone, List<DropCandidate> candidates)
+            {
+                if (zone?.EmptyTile?.coProps == null || candidates == null)
+                    return;
+
+                var score = 200000 + Math.Min(zone.FreeScore, 5000) * 50;
+                candidates.Add(new DropCandidate
+                {
+                    Tile = zone.EmptyTile,
+                    Score = score,
+                    Distance = TileRangeSafe(GetCurrentTile(_hauler), zone.EmptyTile),
+                    OriginalZoneIndex = zone.OriginalIndex,
+                    Reason = "empty-fit zone=" + zone.ZoneName
+                        + " free=" + zone.FreeScore
+                        + " tiles=" + zone.TileCount
+                        + " objects=" + zone.ObjectCount
+                });
+            }
+
+            private void Reserve(DropCandidate candidate, CondOwner item)
+            {
+                if (candidate == null || item == null)
+                    return;
+
+                var count = Math.Max(1, item.StackCount);
+                if (candidate.ExistingStack != null && !string.IsNullOrEmpty(candidate.ExistingStack.strID))
+                {
+                    _reservedStackCounts.TryGetValue(candidate.ExistingStack.strID, out var reserved);
+                    _reservedStackCounts[candidate.ExistingStack.strID] = reserved + count;
+                    return;
+                }
+
+                if (candidate.PlannedStack != null)
+                {
+                    candidate.PlannedStack.Reserved += count;
+                    return;
+                }
+
+                if (candidate.Tile == null)
+                    return;
+
+                _reservedNewTileKeys.Add(TileKey(candidate.Tile));
+
+                if (item.nStackLimit <= 1)
+                    return;
+
+                var key = StackKey(item);
+                if (string.IsNullOrEmpty(key))
+                    return;
+
+                if (!_plannedStacks.TryGetValue(key, out var stacks))
+                {
+                    stacks = new List<PlannedStack>();
+                    _plannedStacks[key] = stacks;
+                }
+
+                stacks.Add(new PlannedStack
+                {
+                    Tile = candidate.Tile,
+                    ZoneKey = FindZoneKey(candidate.Tile),
+                    StackLimit = Math.Max(1, item.nStackLimit),
+                    Reserved = count
+                });
+            }
+
+            private static int CompareDropCandidates(DropCandidate a, DropCandidate b)
+            {
+                if (a == null && b == null)
+                    return 0;
+                if (a == null)
+                    return 1;
+                if (b == null)
+                    return -1;
+
+                var score = b.Score.CompareTo(a.Score);
+                if (score != 0)
+                    return score;
+
+                var distance = a.Distance.CompareTo(b.Distance);
+                if (distance != 0)
+                    return distance;
+
+                var zone = a.OriginalZoneIndex.CompareTo(b.OriginalZoneIndex);
+                if (zone != 0)
+                    return zone;
+
+                return (a.Tile?.Index ?? int.MaxValue).CompareTo(b.Tile?.Index ?? int.MaxValue);
+            }
+
+            private static void ApplyTaskDestination(Task2 task, Tile tile)
+            {
+                if (task == null || tile?.coProps?.ship == null)
+                    return;
+
+                task.nTile = tile.Index;
+                task.strTileShip = tile.coProps.ship.strRegID;
+            }
+
+            private static void ApplyWalkDestination(Interaction walk, Tile tile)
+            {
+                if (walk == null || tile?.coProps == null)
+                    return;
+
+                walk.objThem = tile.coProps;
+                walk.strTargetPoint = "use";
+                walk.fTargetPointRange = 0f;
+            }
+
+            private static bool ZoneAcceptsItem(JsonZone zone, CondOwner item)
+            {
+                try
+                {
+                    if (zone?.categoryConds == null || zone.categoryConds.Length == 0)
+                        return true;
+
+                    foreach (var cond in zone.categoryConds)
+                    {
+                        if (!string.IsNullOrEmpty(cond) && item.HasCond(cond))
+                            return true;
+                    }
+                }
+                catch
+                {
+                }
+
+                return false;
+            }
+
+            private static List<CondOwner> GetZoneObjects(Ship ship, JsonZone zone, CondTrigger validHaulDest)
+            {
+                try
+                {
+                    if (ship == null || zone == null || validHaulDest == null)
+                        return new List<CondOwner>();
+
+                    return ship.GetCOsInZone(zone, validHaulDest, bAllowLocked: false) ?? new List<CondOwner>();
+                }
+                catch
+                {
+                    return new List<CondOwner>();
+                }
+            }
+
+            private bool TryFindEmptyFit(CondOwner item, DropZone zoneInfo, out Tile tile)
+            {
+                tile = null;
+                if (item?.Item == null || zoneInfo?.Ship == null || zoneInfo.Zone?.aTiles == null || zoneInfo.Zone.aTiles.Length == 0)
+                    return false;
+
+                var originalTiles = zoneInfo.Zone.aTiles;
+                var filteredTiles = originalTiles
+                    .Where(t => !_reservedNewTileKeys.Contains(TileKey(zoneInfo.Ship, t)))
+                    .ToArray();
+
+                if (filteredTiles.Length == 0)
+                    return false;
+
+                try
+                {
+                    zoneInfo.Zone.aTiles = filteredTiles;
+                    var vFits = default(UnityEngine.Vector3);
+                    if (!TileUtils.TryFitItem(item.Item, zoneInfo.Ship, zoneInfo.Zone, out vFits))
+                        return false;
+
+                    tile = zoneInfo.Ship.GetTileAtWorldCoords1(vFits.x, vFits.y, bAllowDocked: true);
+                    return tile?.coProps != null && !_reservedNewTileKeys.Contains(TileKey(tile));
+                }
+                catch
+                {
+                    tile = null;
+                    return false;
+                }
+                finally
+                {
+                    zoneInfo.Zone.aTiles = originalTiles;
+                }
+            }
+
+            private static Tile GetTileForCO(Ship ship, CondOwner co)
+            {
+                try
+                {
+                    if (ship == null || co?.tf == null)
+                        return null;
+
+                    return ship.GetTileAtWorldCoords1(co.tf.position.x, co.tf.position.y, bAllowDocked: true);
+                }
+                catch
+                {
+                    return null;
+                }
+            }
+
+            private static int SafeStackCapacity(CondOwner stack, CondOwner incoming)
+            {
+                try
+                {
+                    return Math.Max(0, stack?.CanStackOnItem(incoming) ?? 0);
+                }
+                catch
+                {
+                    return 0;
+                }
+            }
+
+            private int GetReservedStackCount(CondOwner stack)
+            {
+                if (stack == null || string.IsNullOrEmpty(stack.strID))
+                    return 0;
+
+                _reservedStackCounts.TryGetValue(stack.strID, out var reserved);
+                return reserved;
+            }
+
+            private int CountReservedTiles(Ship ship, JsonZone zone)
+            {
+                if (ship == null || zone?.aTiles == null || _reservedNewTileKeys.Count == 0)
+                    return 0;
+
+                var count = 0;
+                foreach (var tileIndex in zone.aTiles)
+                {
+                    if (_reservedNewTileKeys.Contains(TileKey(ship, tileIndex)))
+                        count++;
+                }
+
+                return count;
+            }
+
+            private string FindZoneKey(Tile tile)
+            {
+                if (tile?.coProps?.ship == null)
+                    return "";
+
+                try
+                {
+                    var ship = tile.coProps.ship;
+                    var zones = _hauler?.ship?.GetZones("IsZoneStockpile", _hauler, bAllowDocked: true);
+                    if (zones == null)
+                        return ship.strRegID ?? "";
+
+                    for (var i = 0; i < zones.Count; i++)
+                    {
+                        var zone = zones[i];
+                        if (zone?.aTiles == null || !string.Equals(zone.strRegID, ship.strRegID, StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        if (Array.IndexOf(zone.aTiles, tile.Index) >= 0)
+                            return (zone.strRegID ?? "?") + ":" + (zone.strName ?? i.ToString());
+                    }
+                }
+                catch
+                {
+                }
+
+                return tile.coProps.ship.strRegID ?? "";
+            }
+
+            private static string TileKey(Tile tile)
+            {
+                return tile?.coProps?.ship == null ? "" : TileKey(tile.coProps.ship, tile.Index);
+            }
+
+            private static string TileKey(Ship ship, int tileIndex)
+            {
+                return (ship?.strRegID ?? "?") + ":" + tileIndex;
+            }
+
+            private sealed class DropZone
+            {
+                internal JsonZone Zone;
+                internal Ship Ship;
+                internal List<CondOwner> Objects = new List<CondOwner>();
+                internal Tile EmptyTile;
+                internal string ZoneName;
+                internal string ZoneKey;
+                internal int OriginalIndex;
+                internal int TileCount;
+                internal int ObjectCount;
+                internal int ReservedNewTiles;
+                internal int FreeScore;
+                internal bool CanFitEmpty;
+            }
+
+            private sealed class DropCandidate
+            {
+                internal Tile Tile;
+                internal int Score;
+                internal int Distance;
+                internal int OriginalZoneIndex;
+                internal string Reason;
+                internal CondOwner ExistingStack;
+                internal PlannedStack PlannedStack;
+            }
+
+            private sealed class PlannedStack
+            {
+                internal Tile Tile;
+                internal string ZoneKey;
+                internal int StackLimit;
+                internal int Reserved;
+
+                internal int FreeCapacity => Math.Max(0, StackLimit - Reserved);
+            }
         }
 
         internal sealed class HaulChain

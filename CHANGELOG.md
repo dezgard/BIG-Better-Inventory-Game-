@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.9
+
+- Added smart drop-zone planning for compatible stockpiles.
+- Fixed crowded stockpiles being favored too strongly when another valid zone has open space.
+- Stackable items now prefer valid existing stacks before using new tiles.
+- Batch planning now reserves chosen stack and tile destinations to reduce repeated bad picks.
+- Added `[V2DropPlan]` support-log entries for destination choices.
+- No install changes from 0.8.8.
+
 ## 0.8.8
 
 - Fixed stackable asteroid ore and regolith being allowed into drag hauling.

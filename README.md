@@ -6,11 +6,13 @@ Simple Smart Hauling reduces one-item hauling trips without replacing Ostranauts
 
 The game still creates the haul jobs, haul icons, pickup actions, drop actions, and task cleanup. This mod waits for those vanilla jobs, then compacts safe haul work so the crew member can collect more items before walking back to unload.
 
-Version 0.8.8 uses the rebuilt V2 hauling planner. It checks real container space from backpacks, hand-held containers, carried containers, and dragged containers.
+Version 0.8.9 uses the rebuilt V2 hauling planner. It checks real container space from backpacks, hand-held containers, carried containers, and dragged containers.
 
 If a marked crate, dolly, or storage container can help carry the job, the mod can grab it first. It then keeps collecting loose items if that container has room.
 
 Drag-heavy hauling is handled conservatively. Loose inventory items are picked first. Drag items are kept to one helper container or one normal dragged item when possible.
+
+Drop-off planning now checks compatible stockpile zones before unloading. Stackable items prefer valid stacks, then usable open zone space.
 
 The mod also creates support logs. If something goes wrong, close the game and upload the newest zip from `BepInEx\BIGSupportLogs`.
 
@@ -36,6 +38,10 @@ The mod also creates support logs. If something goes wrong, close the game and u
 - Keeps vanilla drop actions.
 - Supports mixed haul items.
 - Limits hauling to 200 tasks per pass.
+- Scores drop zones.
+- Prefers valid stacks.
+- Reserves planned stacks.
+- Avoids crowded zones.
 - Creates support log zips.
 - Lists installed BepInEx plugins.
 - Lists disabled plugin files.
@@ -61,7 +67,7 @@ Ostranauts\BepInEx\plugins\
 When loaded, the BepInEx log should show:
 
 ```text
-Ostranauts Hauling V2 0.8.8 loaded.
+Ostranauts Hauling V2 0.8.9 loaded.
 ```
 
 ## Support Logs
@@ -83,6 +89,7 @@ The zip includes:
 - Loaded BepInEx plugins.
 - BepInEx dependency errors.
 - Raw files in `BepInEx\plugins`.
+- Drop destination choices.
 
 ## Build From Source
 
