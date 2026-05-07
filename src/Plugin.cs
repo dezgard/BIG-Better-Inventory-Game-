@@ -15,6 +15,7 @@ namespace OstranautsHaulingV2
 {
     internal static class BigSupportLog
     {
+        private const int PreviousSessionLogsToKeep = 2;
         private static readonly object Sync = new object();
         private static string _logDir;
         private static string _sessionLogPath;
@@ -33,6 +34,7 @@ namespace OstranautsHaulingV2
                 _logDir = Path.Combine(GetBepInExRoot(), "BIGSupportLogs");
                 Directory.CreateDirectory(_logDir);
                 ZipPreviousLooseLogs();
+                PurgeOldSupportLogs();
 
                 var stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
                 _sessionLogPath = Path.Combine(_logDir, "BIG-" + stamp + ".log");
@@ -116,6 +118,41 @@ namespace OstranautsHaulingV2
             catch
             {
                 // Best effort only.
+            }
+        }
+
+        private static void PurgeOldSupportLogs()
+        {
+            try
+            {
+                var files = Directory.GetFiles(_logDir, "BIG-*.*")
+                    .Select(path => new FileInfo(path))
+                    .Where(info => string.Equals(info.Extension, ".zip", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(info.Extension, ".log", StringComparison.OrdinalIgnoreCase))
+                    .OrderByDescending(info => info.LastWriteTimeUtc)
+                    .ToList();
+
+                var kept = 0;
+                foreach (var file in files)
+                {
+                    if (kept < PreviousSessionLogsToKeep)
+                    {
+                        kept++;
+                        continue;
+                    }
+
+                    try
+                    {
+                        file.Delete();
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+            catch
+            {
+                // Best effort only. Log cleanup must never block startup.
             }
         }
 
@@ -273,10 +310,10 @@ namespace OstranautsHaulingV2
         }
     }
 
-    [BepInPlugin("com.dezgard.ostranauts.haulingv2", "Ostranauts Hauling V2", "0.8.9")]
+    [BepInPlugin("com.dezgard.ostranauts.haulingv2", "Ostranauts Hauling V2", "0.8.10")]
     public sealed class Plugin : BaseUnityPlugin
     {
-        internal const string PluginVersion = "0.8.9";
+        internal const string PluginVersion = "0.8.10";
         internal static ManualLogSource Log { get; private set; }
         private Harmony _harmony;
 

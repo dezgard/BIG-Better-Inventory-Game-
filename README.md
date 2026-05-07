@@ -6,7 +6,7 @@ Simple Smart Hauling reduces one-item hauling trips without replacing Ostranauts
 
 The game still creates the haul jobs, haul icons, pickup actions, drop actions, and task cleanup. This mod waits for those vanilla jobs, then compacts safe haul work so the crew member can collect more items before walking back to unload.
 
-Version 0.8.9 uses the rebuilt V2 hauling planner. It checks real container space from backpacks, hand-held containers, carried containers, and dragged containers.
+Version 0.8.10 uses the rebuilt V2 hauling planner. It checks real container space from backpacks, hand-held containers, carried containers, and dragged containers.
 
 If a marked crate, dolly, or storage container can help carry the job, the mod can grab it first. It then keeps collecting loose items if that container has room.
 
@@ -45,6 +45,7 @@ The mod also creates support logs. If something goes wrong, close the game and u
 - Creates support log zips.
 - Lists installed BepInEx plugins.
 - Lists disabled plugin files.
+- Keeps recent support logs only.
 
 ## Requirements
 
@@ -67,7 +68,7 @@ Ostranauts\BepInEx\plugins\
 When loaded, the BepInEx log should show:
 
 ```text
-Ostranauts Hauling V2 0.8.9 loaded.
+Ostranauts Hauling V2 0.8.10 loaded.
 ```
 
 ## Support Logs
@@ -81,6 +82,8 @@ Ostranauts\BepInEx\BIGSupportLogs\
 Each game session creates a dated `BIG-*.log` and a matching `BIG-*.zip`.
 
 If the game crashes before the zip is created, start the game once more. The mod will zip loose BIG logs on startup.
+
+The folder keeps the two newest previous support logs and removes older BIG support logs on startup.
 
 The zip includes:
 

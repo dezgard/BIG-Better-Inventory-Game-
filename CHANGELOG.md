@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.10
+
+- Fixed BIG support logs building up across game starts.
+- Startup now zips any loose old BIG logs, then keeps only the two newest previous support logs.
+- Older `BIG-*.log` and `BIG-*.zip` files are removed from `BepInEx\BIGSupportLogs`.
+- No intended hauling behavior changes from 0.8.9.
+
 ## 0.8.9
 
 - Added smart drop-zone planning for compatible stockpiles.
