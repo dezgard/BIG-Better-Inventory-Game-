@@ -6,7 +6,7 @@ Simple Smart Hauling reduces one-item hauling trips without replacing Ostranauts
 
 The game still creates the haul jobs, haul icons, pickup actions, drop actions, and task cleanup. This mod waits for those vanilla jobs, then compacts safe haul work so the crew member can collect more items before walking back to unload.
 
-Version 0.8.10 uses the rebuilt V2 hauling planner. It checks real container space from backpacks, hand-held containers, carried containers, and dragged containers.
+Version 0.8.11 uses the rebuilt V2 hauling planner. It checks real container space from backpacks, hand-held containers, carried containers, and dragged containers.
 
 If a marked crate, dolly, or storage container can help carry the job, the mod can grab it first. It then keeps collecting loose items if that container has room.
 
@@ -30,6 +30,7 @@ The mod also creates support logs. If something goes wrong, close the game and u
 - Picks loose items first.
 - Can grab a helper crate first.
 - Can fill a helper container.
+- Uses helpers only with loose items.
 - Can include one drag item.
 - Avoids multiple drag items.
 - Keeps stackable ore in inventory hauling.
@@ -68,7 +69,7 @@ Ostranauts\BepInEx\plugins\
 When loaded, the BepInEx log should show:
 
 ```text
-Ostranauts Hauling V2 0.8.10 loaded.
+Ostranauts Hauling V2 0.8.11 loaded.
 ```
 
 ## Support Logs

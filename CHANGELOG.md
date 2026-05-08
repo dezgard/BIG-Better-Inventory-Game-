@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.11
+
+- Fixed helper containers being planned after no loose haul items were left.
+- Stopped batch planning as soon as the carried storage plan is full.
+- Tightened helper-container detection so small pickup-only containers are not treated like dollies.
+- Added support-log markers for helper guard decisions.
+- No install changes from 0.8.10.
+
 ## 0.8.10
 
 - Fixed BIG support logs building up across game starts.

@@ -310,10 +310,10 @@ namespace OstranautsHaulingV2
         }
     }
 
-    [BepInPlugin("com.dezgard.ostranauts.haulingv2", "Ostranauts Hauling V2", "0.8.10")]
+    [BepInPlugin("com.dezgard.ostranauts.haulingv2", "Ostranauts Hauling V2", "0.8.11")]
     public sealed class Plugin : BaseUnityPlugin
     {
-        internal const string PluginVersion = "0.8.10";
+        internal const string PluginVersion = "0.8.11";
         internal static ManualLogSource Log { get; private set; }
         private Harmony _harmony;
 
@@ -323,7 +323,7 @@ namespace OstranautsHaulingV2
             BigSupportLog.Init(PluginVersion);
             _harmony = new Harmony("com.dezgard.ostranauts.haulingv2");
             _harmony.PatchAll();
-            ModInfo("Ostranauts Hauling V2 " + PluginVersion + " loaded. Smart drop-zone planning prefers good stacks and open stockpile space. Support zip will be written to " + BigSupportLog.ZipPath);
+            ModInfo("Ostranauts Hauling V2 " + PluginVersion + " loaded. Smart drop-zone planning prefers good stacks and helper containers require loose haul items. Support zip will be written to " + BigSupportLog.ZipPath);
         }
 
         private void OnDestroy()
@@ -492,36 +492,14 @@ namespace OstranautsHaulingV2
 
                     if (inventoryClosed)
                     {
-                        if (allowUtilityDrag && utilityDragChain == null && TryPlanUtilityDragContainer(hauler, task, item, tile, carryPlan, out utilityDragChain, out var fullUtilityReason))
-                        {
-                            inventoryClosed = false;
-                            Plugin.ModInfo("[V2UtilityDragAdded] hauler=" + SafeCO(hauler)
-                                + " reason=" + fullUtilityReason + "/after-capacity"
-                                + " item={" + DescribeItem(item) + "}");
-                            if (!string.IsNullOrEmpty(item.strID))
-                                seenItemIDs.Add(item.strID);
-                            continue;
-                        }
-
-                        if (allowExtraDrag && utilityDragChain == null && dragChain == null && IsOneTripDragCandidate(hauler, item, out var fullDragReason))
-                        {
-                            if (!TryQueueVanillaHaulChain(hauler, task, item, tile, out dragChain, out var fullDragQueueReason))
-                            {
-                                workManager.UnclaimTask(task);
-                                Plugin.ModInfo("[V2HaulDragQueueStop] hauler=" + SafeCO(hauler)
-                                    + " reason=" + fullDragQueueReason
-                                    + " item={" + DescribeItem(item) + "}");
-                                break;
-                            }
-
-                            Plugin.ModInfo("[V2HaulDragAdded] hauler=" + SafeCO(hauler)
-                                + " reason=" + fullDragReason
-                                + " item={" + DescribeItem(item) + "}");
-                            break;
-                        }
-
-                        skippedTasks.Add(task);
-                        continue;
+                        workManager.UnclaimTask(task);
+                        Plugin.ModInfo("[V2HaulInventoryClosedStop] hauler=" + SafeCO(hauler)
+                            + " reason=inventory-closed"
+                            + " plannedItems=" + looseChains.Count
+                            + " utilityDrag=" + (utilityDragChain != null)
+                            + " dragAdded=" + (dragChain != null)
+                            + " item={" + DescribeItem(item) + "}");
+                        break;
                     }
 
                     if (!carryPlan.TryReserve(item, out var reserveReason))
@@ -563,10 +541,7 @@ namespace OstranautsHaulingV2
                                 + " dragAdded=" + (dragChain != null)
                                 + " carry={" + carryPlan.Description + "}"
                                 + " item={" + DescribeItem(item) + "}");
-                            if (dragChain != null)
-                                break;
-
-                            continue;
+                            break;
                         }
 
                         skippedTasks.Add(task);
@@ -597,6 +572,15 @@ namespace OstranautsHaulingV2
                 var chains = new List<HaulChain>(looseChains);
                 if (utilityDragChain == null && dragChain != null)
                     chains.Add(dragChain);
+
+                if (utilityDragChain != null && looseChains.Count == 0)
+                {
+                    Plugin.ModInfo("[V2UtilityDragNoLoose] hauler=" + SafeCO(hauler)
+                        + " reason=no-loose-items"
+                        + " item={" + DescribeItem(utilityDragChain.Item) + "}"
+                        + " queue={" + QueueSummary(hauler) + "}");
+                    return;
+                }
 
                 if (chains.Count <= 1 && utilityDragChain == null)
                     return;
@@ -942,14 +926,41 @@ namespace OstranautsHaulingV2
                 return false;
             }
 
-            if (!CanTrigger(hauler, item, "PickupItemStack") && !HasDragSlot(item) && !CanTrigger(hauler, item, "PickupDragStartNPCPledge") && !CanTrigger(hauler, item, "PickupDragStart"))
+            var canDragAsHelper = HasDragSlot(item)
+                || CanTrigger(hauler, item, "PickupDragStartNPCPledge")
+                || CanTrigger(hauler, item, "PickupDragStart");
+            if (!canDragAsHelper)
             {
-                reason = "not-draggable";
+                reason = "not-drag-helper";
+                return false;
+            }
+
+            var containerCells = ContainerGridCellCount(item);
+            if (containerCells > 0 && containerCells < 9)
+            {
+                reason = "container-grid-too-small-" + containerCells;
                 return false;
             }
 
             reason = "";
             return true;
+        }
+
+        private static int ContainerGridCellCount(CondOwner item)
+        {
+            try
+            {
+                if (item?.objContainer?.gridLayout != null)
+                    return Math.Max(0, item.objContainer.gridLayout.gridMaxX * item.objContainer.gridLayout.gridMaxY);
+
+                if (item?.HasCond("IsInfiniteContainer") ?? false)
+                    return int.MaxValue;
+            }
+            catch
+            {
+            }
+
+            return 0;
         }
 
         private static bool IsOneTripDragCandidate(CondOwner hauler, CondOwner item, out string reason)
