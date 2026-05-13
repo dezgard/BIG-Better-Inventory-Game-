@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.8.17
+
+- Deferred blocked primary haul jobs when other loose items can still fit.
+- Added a controlled one-item drag fallback after loose hauling is exhausted.
+- Added clearer logs for skipped duplicate and destination-mismatch haul jobs.
+- No install changes from 0.8.16.
+
+## 0.8.16
+
+- Active dragged helpers now only defer drag jobs when a loose haul item can actually fit.
+- When the helper can no longer take loose items, BIG queues a helper drop/release before returning to drag hauling.
+- Added clearer support-log markers for helper release decisions.
+- No install changes from 0.8.15.
+
+## 0.8.15
+
+- Prioritized the active dragged helper container before backpacks and hand-held containers.
+- Stopped rejecting bulky loose items just because they are cumbersome or have a drag slot while a helper is active.
+- Other containers are still kept out of active-helper filling so the hauler does not swap helpers mid-job.
+- This should let equipment trucks and dollies fill with more selected loose items before vanilla drag hauling resumes.
+- No install changes from 0.8.14.
+
+## 0.8.14
+
+- Fixed active helper containers treating some bulky loose objects like normal inventory pickups.
+- Doors, stools, pumps, crates, and similar drag-capable objects are now left for the drag phase while the helper fills with true loose inventory items.
+- Stackable inventory items remain eligible for helper filling.
+- Added clearer skip reasons to support logs for active-helper filtering.
+- No install changes from 0.8.13.
+
+## 0.8.13
+
+- Locked an already-dragged container as the active hauling helper.
+- Skipped haul jobs for that helper while loose inventory items are still available.
+- Deferred drag-primary jobs when loose haul jobs can still be batched into the active helper.
+- Added support-log markers for active helper and deferred primary decisions.
+- No install changes from 0.8.12.
+
+## 0.8.12
+
+- Disabled automatic helper-container grabbing to prevent dolly, crate, and furniture swaps.
+- Disabled adding normal drag items into loose-item batches.
+- Kept attached storage support for backpacks, hand-held containers, carried containers, and dragged containers.
+- Added a log marker when BIG skips a drag primary instead of batching it.
+- No install changes from 0.8.11.
+
 ## 0.8.11
 
 - Fixed helper containers being planned after no loose haul items were left.

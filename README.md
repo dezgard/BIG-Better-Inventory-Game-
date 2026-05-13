@@ -6,11 +6,19 @@ Simple Smart Hauling reduces one-item hauling trips without replacing Ostranauts
 
 The game still creates the haul jobs, haul icons, pickup actions, drop actions, and task cleanup. This mod waits for those vanilla jobs, then compacts safe haul work so the crew member can collect more items before walking back to unload.
 
-Version 0.8.11 uses the rebuilt V2 hauling planner. It checks real container space from backpacks, hand-held containers, carried containers, and dragged containers.
+Version 0.8.17 uses the rebuilt V2 hauling planner. It checks real container space from backpacks, hand-held containers, carried containers, and dragged containers.
 
-If a marked crate, dolly, or storage container can help carry the job, the mod can grab it first. It then keeps collecting loose items if that container has room.
+If the crew member already has usable storage equipped, carried, or dragged, the mod can fill that storage during loose-item hauling.
 
-Drag-heavy hauling is handled conservatively. Loose inventory items are picked first. Drag items are kept to one helper container or one normal dragged item when possible.
+Drag-heavy hauling is handled conservatively. Loose inventory items are batched first. Drag items are kept separate from loose batching for stability.
+
+When a usable container is already in the drag slot, BIG treats it as the active helper and keeps other drag jobs out of the loose-item pass.
+
+While filling an active helper, BIG lets the helper decide what can fit instead of blocking bulky loose items too early.
+
+When the active helper can no longer take loose haul items, BIG drops/releases it before returning to normal drag hauling.
+
+If loose hauling is exhausted, BIG can hand off one drag item cleanly instead of trying to mix drag work into the loose-item batch.
 
 Drop-off planning now checks compatible stockpile zones before unloading. Stackable items prefer valid stacks, then usable open zone space.
 
@@ -27,12 +35,16 @@ The mod also creates support logs. If something goes wrong, close the game and u
 - Uses hand-held containers.
 - Uses carried containers.
 - Uses dragged container storage.
+- Locks the active dragged helper.
+- Prioritizes the active dragged helper.
+- Releases the helper before drag hauling.
+- Uses controlled drag fallback.
 - Picks loose items first.
-- Can grab a helper crate first.
-- Can fill a helper container.
-- Uses helpers only with loose items.
-- Can include one drag item.
-- Avoids multiple drag items.
+- Can fill attached helper storage.
+- Does not auto-grab helper containers.
+- Keeps drag items separate.
+- Avoids mixing drag items into loose batches.
+- Lets helper storage accept bulky loose items.
 - Keeps stackable ore in inventory hauling.
 - Sorts pickups by path.
 - Stops when storage is full.
@@ -69,7 +81,7 @@ Ostranauts\BepInEx\plugins\
 When loaded, the BepInEx log should show:
 
 ```text
-Ostranauts Hauling V2 0.8.11 loaded.
+Ostranauts Hauling V2 0.8.17 loaded.
 ```
 
 ## Support Logs

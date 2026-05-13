@@ -310,10 +310,10 @@ namespace OstranautsHaulingV2
         }
     }
 
-    [BepInPlugin("com.dezgard.ostranauts.haulingv2", "Ostranauts Hauling V2", "0.8.11")]
+    [BepInPlugin("com.dezgard.ostranauts.haulingv2", "Ostranauts Hauling V2", "0.8.17")]
     public sealed class Plugin : BaseUnityPlugin
     {
-        internal const string PluginVersion = "0.8.11";
+        internal const string PluginVersion = "0.8.17";
         internal static ManualLogSource Log { get; private set; }
         private Harmony _harmony;
 
@@ -394,6 +394,13 @@ namespace OstranautsHaulingV2
                     return;
                 }
 
+                if (carryPlan.HasActiveDragContainer)
+                {
+                    Plugin.ModInfo("[V2ActiveDragHelper] hauler=" + SafeCO(hauler)
+                        + " helper={" + carryPlan.ActiveDragContainerDescription + "}"
+                        + " carry={" + carryPlan.Description + "}");
+                }
+
                 var workManager = CrewSim.objInstance?.workManager;
                 if (workManager == null)
                     return;
@@ -413,17 +420,72 @@ namespace OstranautsHaulingV2
                 var looseChains = new List<HaulChain>();
                 HaulChain utilityDragChain = null;
                 HaulChain dragChain = null;
-                var allowExtraDrag = !carryPlan.DragSlotOccupied;
-                var allowUtilityDrag = !carryPlan.DragSlotOccupied;
+                // Keep draggable work out of loose batching. Attached storage is still used.
+                var allowExtraDrag = false;
+                var allowUtilityDrag = false;
                 var seenItemIDs = new HashSet<string>();
                 if (!string.IsNullOrEmpty(primary.Item?.strID))
                     seenItemIDs.Add(primary.Item.strID);
 
                 var inventoryClosed = false;
+                var primaryDeferred = false;
                 if (TryClassifyPrimary(hauler, primary, carryPlan, looseChains, ref utilityDragChain, ref dragChain, allowExtraDrag, allowUtilityDrag, out var primaryStopReason))
+                {
                     inventoryClosed = primaryStopReason == "inventory-full";
+                }
+                else if (ShouldDeferPrimaryForActiveHelper(hauler, workManager, primary, carryPlan, destinationShipID, out var deferReason))
+                {
+                    if (!TryDeferPrimaryHaulChain(workManager, hauler, primary, deferReason, out var deferFailReason))
+                    {
+                        Plugin.ModInfo("[V2HelperPrimaryDeferFailed] hauler=" + SafeCO(hauler)
+                            + " reason=" + deferFailReason
+                            + " item={" + DescribeItem(primary.Item) + "}"
+                            + " queue={" + QueueSummary(hauler) + "}");
+                        return;
+                    }
+
+                    primaryDeferred = true;
+                    if (!string.IsNullOrEmpty(primary.Item?.strID))
+                        seenItemIDs.Remove(primary.Item.strID);
+                }
+                else if (ShouldDeferPrimaryForLooseFit(hauler, workManager, primary, carryPlan, destinationShipID, primaryStopReason, out deferReason))
+                {
+                    if (!TryDeferPrimaryHaulChain(workManager, hauler, primary, deferReason, out var deferFailReason))
+                    {
+                        Plugin.ModInfo("[V2PrimaryDeferFailed] hauler=" + SafeCO(hauler)
+                            + " reason=" + deferFailReason
+                            + " item={" + DescribeItem(primary.Item) + "}"
+                            + " queue={" + QueueSummary(hauler) + "}");
+                        return;
+                    }
+
+                    primaryDeferred = true;
+                    if (!string.IsNullOrEmpty(primary.Item?.strID))
+                        seenItemIDs.Remove(primary.Item.strID);
+                }
                 else
+                {
+                    if (TryQueueActiveHelperReleaseBeforePrimary(hauler, workManager, primary, carryPlan, dropPlan, out var releaseReason))
+                    {
+                        Plugin.ModInfo("[V2ActiveHelperReleaseQueued] hauler=" + SafeCO(hauler)
+                            + " reason=" + releaseReason
+                            + " helper={" + carryPlan.ActiveDragContainerDescription + "}"
+                            + " primary={" + DescribeItem(primary.Item) + "}"
+                            + " queue={" + QueueSummary(hauler) + "}");
+                        return;
+                    }
+
+                    if (TryQueueControlledPrimaryDrag(hauler, workManager, primary, dropPlan, primaryStopReason, out var dragReason))
+                    {
+                        Plugin.ModInfo("[V2PrimaryControlledDrag] hauler=" + SafeCO(hauler)
+                            + " reason=" + dragReason
+                            + " item={" + DescribeItem(primary.Item) + "}"
+                            + " queue={" + QueueSummary(hauler) + "}");
+                        return;
+                    }
+
                     return;
+                }
 
                 for (var i = 1; i < HardSafetyLimit; i++)
                 {
@@ -441,17 +503,34 @@ namespace OstranautsHaulingV2
 
                     if (!string.IsNullOrEmpty(item?.strID) && seenItemIDs.Contains(item.strID))
                     {
+                        task.fLastCheck = StarSystem.fEpoch;
                         skippedTasks.Add(task);
+                        Plugin.ModInfo("[V2HaulSkipForLater] hauler=" + SafeCO(hauler)
+                            + " reason=duplicate"
+                            + " item={" + DescribeItem(item) + "}");
                         continue;
                     }
 
                     if (!string.Equals(task.strTileShip, destinationShipID, StringComparison.OrdinalIgnoreCase))
                     {
+                        task.fLastCheck = StarSystem.fEpoch;
                         skippedTasks.Add(task);
+                        Plugin.ModInfo("[V2HaulSkipForLater] hauler=" + SafeCO(hauler)
+                            + " reason=destination-mismatch"
+                            + " item={" + DescribeItem(item) + "}");
                         continue;
                     }
 
-                    if (!IsLooseInventoryPickup(hauler, item, out var itemReason))
+                    if (carryPlan.IsActiveDragContainer(item))
+                    {
+                        skippedTasks.Add(task);
+                        Plugin.ModInfo("[V2HelperCargoSkipped] hauler=" + SafeCO(hauler)
+                            + " reason=active-drag-helper"
+                            + " item={" + DescribeItem(item) + "}");
+                        continue;
+                    }
+
+                    if (!IsBatchableLoosePickup(hauler, item, carryPlan, out var itemReason))
                     {
                         if (allowUtilityDrag && utilityDragChain == null && TryPlanUtilityDragContainer(hauler, task, item, tile, carryPlan, out utilityDragChain, out var utilityReason))
                         {
@@ -583,7 +662,17 @@ namespace OstranautsHaulingV2
                 }
 
                 if (chains.Count <= 1 && utilityDragChain == null)
+                {
+                    if (primaryDeferred)
+                    {
+                        Plugin.ModInfo("[V2PrimaryDeferredNoBatch] hauler=" + SafeCO(hauler)
+                            + " reason=not-enough-loose-claimed"
+                            + " loose=" + looseChains.Count
+                            + " queue={" + QueueSummary(hauler) + "}");
+                    }
+
                     return;
+                }
 
                 CompactLeadingHaulChains(hauler, utilityDragChain, chains);
 
@@ -618,13 +707,495 @@ namespace OstranautsHaulingV2
             }
         }
 
+        private static bool ShouldDeferPrimaryForActiveHelper(CondOwner hauler, WorkManager workManager, HaulChain primary, CarriedContainerPlan carryPlan, string destinationShipID, out string reason)
+        {
+            reason = "other";
+            if (hauler == null || workManager == null || primary?.Item == null || carryPlan == null)
+            {
+                reason = "null";
+                return false;
+            }
+
+            if (!carryPlan.HasActiveDragContainer)
+            {
+                reason = "no-active-drag-helper";
+                return false;
+            }
+
+            if (!HasLooseHaulTaskAvailable(hauler, workManager, carryPlan, destinationShipID, out var looseCount, out var firstLoose, out var probeReason))
+            {
+                reason = probeReason;
+                Plugin.ModInfo("[V2HelperPrimaryNotDeferred] hauler=" + SafeCO(hauler)
+                    + " reason=" + reason
+                    + " helper={" + carryPlan.ActiveDragContainerDescription + "}"
+                    + " primary={" + DescribeItem(primary.Item) + "}");
+                return false;
+            }
+
+            reason = (carryPlan.IsActiveDragContainer(primary.Item) ? "active-helper-primary" : "drag-primary")
+                + "/looseAvailable=" + looseCount
+                + "/firstLoose=" + firstLoose;
+            return true;
+        }
+
+        private static bool ShouldDeferPrimaryForLooseFit(CondOwner hauler, WorkManager workManager, HaulChain primary, CarriedContainerPlan carryPlan, string destinationShipID, string primaryStopReason, out string reason)
+        {
+            reason = "other";
+            if (hauler == null || workManager == null || primary?.Item == null || carryPlan == null)
+            {
+                reason = "null";
+                return false;
+            }
+
+            if (!IsPrimaryLooseDeferrable(primaryStopReason))
+            {
+                reason = "primary-not-deferrable/" + (primaryStopReason ?? "");
+                return false;
+            }
+
+            if (!HasLooseHaulTaskAvailable(hauler, workManager, carryPlan, destinationShipID, out var looseCount, out var firstLoose, out var probeReason))
+            {
+                reason = probeReason;
+                Plugin.ModInfo("[V2PrimaryNotDeferred] hauler=" + SafeCO(hauler)
+                    + " reason=" + reason
+                    + " primaryReason=" + primaryStopReason
+                    + " primary={" + DescribeItem(primary.Item) + "}");
+                return false;
+            }
+
+            reason = "primary-" + primaryStopReason
+                + "/looseAvailable=" + looseCount
+                + "/firstLoose=" + firstLoose;
+            return true;
+        }
+
+        private static bool IsPrimaryLooseDeferrable(string reason)
+        {
+            return reason == "container-reject"
+                || reason == "too-large"
+                || reason == "no-grid-room"
+                || reason == "drag-only"
+                || reason == "no-pickup-stack";
+        }
+
+        private static bool HasLooseHaulTaskAvailable(CondOwner hauler, WorkManager workManager, CarriedContainerPlan carryPlan, string destinationShipID, out int looseCount, out string firstLoose, out string reason)
+        {
+            looseCount = 0;
+            firstLoose = "<none>";
+            reason = "other";
+
+            List<Task2> tasks;
+            try
+            {
+                tasks = workManager.GetAllTasks();
+            }
+            catch
+            {
+                return false;
+            }
+
+            if (tasks == null)
+            {
+                reason = "no-task-list";
+                return false;
+            }
+
+            if (!CarriedContainerPlan.TryCreate(hauler, out var probePlan, out var planReason, log: false))
+            {
+                reason = "no-probe-plan/" + planReason;
+                return false;
+            }
+
+            var scannedLoose = 0;
+            var firstBlocked = "<none>";
+
+            foreach (var task in tasks)
+            {
+                if (!IsHaulTask(task))
+                    continue;
+
+                if (!string.IsNullOrEmpty(destinationShipID)
+                    && !string.IsNullOrEmpty(task.strTileShip)
+                    && !string.Equals(task.strTileShip, destinationShipID, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                CondOwner item = null;
+                try
+                {
+                    if (string.IsNullOrEmpty(task.strTargetCOID) || !DataHandler.mapCOs.TryGetValue(task.strTargetCOID, out item))
+                        continue;
+                }
+                catch
+                {
+                    continue;
+                }
+
+                if (carryPlan != null && carryPlan.IsActiveDragContainer(item))
+                    continue;
+
+                if (!IsBatchableLoosePickup(hauler, item, carryPlan, out _))
+                    continue;
+
+                scannedLoose++;
+                if (!probePlan.TryReserve(item, out var reserveReason))
+                {
+                    if (firstBlocked == "<none>")
+                        firstBlocked = SafeCO(item) + "/" + reserveReason;
+
+                    continue;
+                }
+
+                looseCount++;
+                firstLoose = SafeCO(item);
+                reason = "loose-fit/scanned=" + scannedLoose;
+                return true;
+            }
+
+            reason = scannedLoose > 0
+                ? "no-loose-fit/scanned=" + scannedLoose + "/firstBlocked=" + firstBlocked
+                : "no-loose-tasks";
+            return false;
+        }
+
+        private static bool TryQueueActiveHelperReleaseBeforePrimary(CondOwner hauler, WorkManager workManager, HaulChain primary, CarriedContainerPlan carryPlan, DropDestinationPlanner dropPlan, out string reason)
+        {
+            reason = "other";
+            if (hauler?.aQueue == null || workManager == null || primary == null || carryPlan == null || !carryPlan.HasActiveDragContainer)
+            {
+                reason = "not-active-helper";
+                return false;
+            }
+
+            var helper = carryPlan.ActiveDragContainer;
+            if (helper == null)
+            {
+                reason = "missing-helper";
+                return false;
+            }
+
+            var helperTask = FindHaulTaskForItem(workManager, helper);
+            if (!TryResolveActiveHelperReleaseTile(hauler, workManager, helperTask, helper, primary, dropPlan, out var releaseTile, out var tileReason))
+            {
+                reason = "no-release-tile/" + tileReason;
+                return false;
+            }
+
+            var walk = DataHandler.GetInteraction("Walk");
+            var stopDrag = DataHandler.GetInteraction("PickupDragStop");
+            if (walk == null || stopDrag == null)
+            {
+                reason = "missing-interaction";
+                return false;
+            }
+
+            var originalQueue = new List<Interaction>(hauler.aQueue);
+            hauler.aQueue.Clear();
+
+            walk.strTargetPoint = "use";
+            walk.fTargetPointRange = 0f;
+            if (!hauler.QueueInteraction(releaseTile.coProps, walk))
+            {
+                hauler.aQueue.Clear();
+                hauler.aQueue.AddRange(originalQueue);
+                reason = "walk-queue-failed";
+                return false;
+            }
+
+            if (!hauler.QueueInteraction(hauler, stopDrag))
+            {
+                hauler.aQueue.Clear();
+                hauler.aQueue.AddRange(originalQueue);
+                reason = "stop-drag-queue-failed";
+                return false;
+            }
+
+            if (helperTask != null)
+                workManager.RemoveTask(helperTask);
+
+            if (!carryPlan.IsActiveDragContainer(primary.Item))
+                hauler.aQueue.AddRange(originalQueue);
+
+            reason = tileReason + "/removedHelperTask=" + (helperTask != null);
+            return true;
+        }
+
+        private static bool TryQueueControlledPrimaryDrag(CondOwner hauler, WorkManager workManager, HaulChain primary, DropDestinationPlanner dropPlan, string primaryStopReason, out string reason)
+        {
+            reason = "other";
+            if (hauler?.aQueue == null || workManager == null || primary?.Item == null)
+            {
+                reason = "null";
+                return false;
+            }
+
+            if (!IsPrimaryLooseDeferrable(primaryStopReason))
+            {
+                reason = "primary-not-drag-fallback/" + (primaryStopReason ?? "");
+                return false;
+            }
+
+            if (!IsOneTripDragCandidate(hauler, primary.Item, out var dragReason))
+            {
+                reason = "not-drag-candidate/" + dragReason;
+                return false;
+            }
+
+            var task = FindActivePrimaryHaulTask(workManager, primary);
+            if (task == null)
+            {
+                reason = "active-task-not-found";
+                return false;
+            }
+
+            var tile = ResolveHaulDestination(hauler, task, primary.Item, dropPlan);
+            if (tile?.coProps == null)
+            {
+                reason = "no-destination";
+                return false;
+            }
+
+            var pickup = GetDragStartInteraction(hauler, primary.Item, out var pickupReason);
+            var walk = DataHandler.GetInteraction("Walk");
+            var stopDrag = DataHandler.GetInteraction("PickupDragStop");
+            if (pickup == null || walk == null || stopDrag == null)
+            {
+                reason = "missing-interaction/" + pickupReason;
+                return false;
+            }
+
+            var originalQueue = new List<Interaction>(hauler.aQueue);
+            var tail = new List<Interaction>();
+            for (var i = 3; i < originalQueue.Count; i++)
+                tail.Add(originalQueue[i]);
+
+            hauler.aQueue.Clear();
+            if (!hauler.QueueInteraction(primary.Item, pickup))
+            {
+                RestoreQueue(hauler, originalQueue);
+                reason = "pickup-drag-queue-failed";
+                return false;
+            }
+
+            walk.strTargetPoint = "use";
+            walk.fTargetPointRange = 0f;
+            if (!hauler.QueueInteraction(tile.coProps, walk))
+            {
+                RestoreQueue(hauler, originalQueue);
+                reason = "walk-queue-failed";
+                return false;
+            }
+
+            if (!hauler.QueueInteraction(hauler, stopDrag))
+            {
+                RestoreQueue(hauler, originalQueue);
+                reason = "stop-drag-queue-failed";
+                return false;
+            }
+
+            hauler.aQueue.AddRange(tail);
+            task.strInteraction = pickup.strName;
+            task.SetIA(pickup);
+
+            reason = dragReason + "/primary-" + primaryStopReason + "/dest=" + DescribeTile(tile);
+            return true;
+        }
+
+        private static Interaction GetDragStartInteraction(CondOwner hauler, CondOwner item, out string reason)
+        {
+            reason = "other";
+            if (CanTrigger(hauler, item, "PickupDragStartNPCPledge"))
+            {
+                reason = "npc-pledge";
+                return DataHandler.GetInteraction("PickupDragStartNPCPledge");
+            }
+
+            if (CanTrigger(hauler, item, "PickupDragStart"))
+            {
+                reason = "drag-start";
+                return DataHandler.GetInteraction("PickupDragStart");
+            }
+
+            reason = "no-trigger";
+            return null;
+        }
+
+        private static void RestoreQueue(CondOwner hauler, List<Interaction> originalQueue)
+        {
+            if (hauler?.aQueue == null || originalQueue == null)
+                return;
+
+            hauler.aQueue.Clear();
+            hauler.aQueue.AddRange(originalQueue);
+        }
+
+        private static bool TryResolveActiveHelperReleaseTile(CondOwner hauler, WorkManager workManager, Task2 helperTask, CondOwner helper, HaulChain primary, DropDestinationPlanner dropPlan, out Tile tile, out string reason)
+        {
+            tile = null;
+            reason = "other";
+
+            if (helperTask != null)
+            {
+                tile = ResolveHaulDestination(hauler, helperTask, helper, dropPlan);
+                if (tile?.coProps != null)
+                {
+                    reason = "helper-task-zone";
+                    return true;
+                }
+            }
+
+            if (primary?.Walk?.objThem != null && TryGetTileFromProps(primary.Walk.objThem, out tile))
+            {
+                reason = "primary-destination";
+                return true;
+            }
+
+            reason = "no-zone";
+            return false;
+        }
+
+        private static Task2 FindHaulTaskForItem(WorkManager workManager, CondOwner item)
+        {
+            if (workManager == null || item == null || string.IsNullOrEmpty(item.strID))
+                return null;
+
+            Task2 task = null;
+            try
+            {
+                task = workManager.GetTask(item.strID, "ACTHaulItem");
+            }
+            catch
+            {
+                task = null;
+            }
+
+            if (task != null)
+                return task;
+
+            try
+            {
+                task = workManager.GetTask(item.strID, "PickupItemStack");
+            }
+            catch
+            {
+                task = null;
+            }
+
+            return task;
+        }
+
+        private static bool TryGetTileFromProps(CondOwner props, out Tile tile)
+        {
+            tile = null;
+            try
+            {
+                if (props?.ship == null)
+                    return false;
+
+                tile = props.ship.GetTileAtWorldCoords1(props.tf.position.x, props.tf.position.y, bAllowDocked: true);
+                return tile?.coProps != null;
+            }
+            catch
+            {
+                tile = null;
+                return false;
+            }
+        }
+
+        private static bool TryDeferPrimaryHaulChain(WorkManager workManager, CondOwner hauler, HaulChain primary, string reason, out string failReason)
+        {
+            failReason = "other";
+            if (workManager == null || hauler?.aQueue == null || primary?.Item == null)
+            {
+                failReason = "null";
+                return false;
+            }
+
+            if (hauler.aQueue.Count < 3)
+            {
+                failReason = "queue-too-short";
+                return false;
+            }
+
+            var task = FindActivePrimaryHaulTask(workManager, primary);
+            if (task == null)
+            {
+                failReason = "active-task-not-found";
+                return false;
+            }
+
+            task.fLastCheck = StarSystem.fEpoch;
+            task.strInteraction = "ACTHaulItem";
+            workManager.UnclaimTask(task);
+            RemoveQueuedHead(hauler, 3);
+
+            Plugin.ModInfo("[V2PrimaryDeferred] hauler=" + SafeCO(hauler)
+                + " reason=" + reason
+                + " item={" + DescribeItem(primary.Item) + "}"
+                + " queue={" + QueueSummary(hauler) + "}");
+
+            failReason = "";
+            return true;
+        }
+
+        private static Task2 FindActivePrimaryHaulTask(WorkManager workManager, HaulChain primary)
+        {
+            if (workManager == null || primary?.Item == null || string.IsNullOrEmpty(primary.Item.strID))
+                return null;
+
+            Task2 task = null;
+            try
+            {
+                task = workManager.GetTask(primary.Item.strID, "PickupItemStack");
+            }
+            catch
+            {
+                task = null;
+            }
+
+            if (IsTaskForChain(task, primary))
+                return task;
+
+            try
+            {
+                task = workManager.GetTask(primary.Item.strID, "ACTHaulItem");
+            }
+            catch
+            {
+                task = null;
+            }
+
+            return IsTaskForChain(task, primary) ? task : null;
+        }
+
+        private static bool IsTaskForChain(Task2 task, HaulChain chain)
+        {
+            if (task == null || chain?.Item == null)
+                return false;
+
+            var ia = task.GetIA();
+            return ia != null && ReferenceEquals(ia.objThem, chain.Item);
+        }
+
+        private static void RemoveQueuedHead(CondOwner hauler, int count)
+        {
+            var queue = hauler?.aQueue;
+            if (queue == null || count <= 0)
+                return;
+
+            var remove = Math.Min(count, queue.Count);
+            for (var i = 0; i < remove; i++)
+                queue.RemoveAt(0);
+        }
+
         private static bool TryClassifyPrimary(CondOwner hauler, HaulChain primary, CarriedContainerPlan carryPlan, List<HaulChain> looseChains, ref HaulChain utilityDragChain, ref HaulChain dragChain, bool allowExtraDrag, bool allowUtilityDrag, out string stopReason)
         {
             stopReason = "";
             if (primary?.Item == null)
                 return false;
 
-            if (!IsLooseInventoryPickup(hauler, primary.Item, out var primaryReason))
+            if (!IsBatchableLoosePickup(hauler, primary.Item, carryPlan, out var primaryReason))
             {
                 if (allowUtilityDrag && utilityDragChain == null && TryPlanPrimaryUtilityDragContainer(hauler, primary, carryPlan, out utilityDragChain, out var utilityReason))
                 {
@@ -643,9 +1214,15 @@ namespace OstranautsHaulingV2
                     return true;
                 }
 
+                Plugin.ModInfo("[V2HaulDragPrimarySkipped] hauler=" + SafeCO(hauler)
+                    + " reason=" + (carryPlan.DragSlotOccupied ? "drag-slot-occupied" : "drag-batching-disabled") + "/primary-" + primaryReason
+                    + " carry={" + carryPlan.Description + "}"
+                    + " item={" + DescribeItem(primary.Item) + "}");
+
                 Plugin.ModInfo("[V2HaulVanillaPrimary] hauler=" + SafeCO(hauler)
                     + " reason=" + primaryReason
                     + " item={" + DescribeItem(primary.Item) + "}");
+                stopReason = primaryReason;
                 return false;
             }
 
@@ -873,6 +1450,45 @@ namespace OstranautsHaulingV2
 
             reason = "";
             return true;
+        }
+
+        private static bool IsBatchableLoosePickup(CondOwner hauler, CondOwner item, CarriedContainerPlan carryPlan, out string reason)
+        {
+            if (!IsLooseInventoryPickup(hauler, item, out reason))
+                return false;
+
+            if (carryPlan == null || !carryPlan.HasActiveDragContainer)
+                return true;
+
+            if (IsUnsafeActiveHelperLoosePickup(item, carryPlan, out reason))
+                return false;
+
+            reason = "";
+            return true;
+        }
+
+        private static bool IsUnsafeActiveHelperLoosePickup(CondOwner item, CarriedContainerPlan carryPlan, out string reason)
+        {
+            reason = "";
+            if (item == null)
+            {
+                reason = "active-helper-null";
+                return true;
+            }
+
+            if (carryPlan != null && carryPlan.IsActiveDragContainer(item))
+            {
+                reason = "active-helper-self";
+                return true;
+            }
+
+            if (item.objContainer != null)
+            {
+                reason = "active-helper-container";
+                return true;
+            }
+
+            return false;
         }
 
         private static bool IsUtilityDragContainerCandidate(CondOwner hauler, CondOwner item, out string reason)
@@ -2237,12 +2853,17 @@ namespace OstranautsHaulingV2
     {
         private readonly List<ContainerState> _containers;
         private readonly HashSet<string> _containerIDs;
+        private readonly string _activeDragContainerID;
+        private readonly string _activeDragContainerLabel;
         private int _reservedItems;
 
-        private CarriedContainerPlan(List<ContainerCandidate> candidates, bool dragSlotOccupied)
+        private CarriedContainerPlan(List<ContainerCandidate> candidates, bool dragSlotOccupied, CondOwner activeDragContainer)
         {
             DragSlotOccupied = dragSlotOccupied;
-            candidates.Sort((a, b) => b.Score.CompareTo(a.Score));
+            _activeDragContainerID = activeDragContainer?.strID ?? "";
+            _activeDragContainerLabel = VanillaHaulBatcherSafeCO(activeDragContainer);
+            ActiveDragContainer = activeDragContainer;
+            candidates.Sort((a, b) => CompareContainerCandidates(a, b, _activeDragContainerID));
 
             _containers = new List<ContainerState>();
             _containerIDs = new HashSet<string>();
@@ -2256,6 +2877,18 @@ namespace OstranautsHaulingV2
         }
 
         internal bool DragSlotOccupied { get; }
+
+        internal bool HasActiveDragContainer
+        {
+            get { return !string.IsNullOrEmpty(_activeDragContainerID) && _containerIDs.Contains(_activeDragContainerID); }
+        }
+
+        internal string ActiveDragContainerDescription
+        {
+            get { return HasActiveDragContainer ? _activeDragContainerLabel : "<none>"; }
+        }
+
+        internal CondOwner ActiveDragContainer { get; }
 
         internal string Description
         {
@@ -2280,12 +2913,13 @@ namespace OstranautsHaulingV2
             }
         }
 
-        internal static bool TryCreate(CondOwner hauler, out CarriedContainerPlan plan, out string reason)
+        internal static bool TryCreate(CondOwner hauler, out CarriedContainerPlan plan, out string reason, bool log = true)
         {
             plan = null;
             reason = "other";
 
-            var dragSlotOccupied = VanillaHaulBatcher.GetDragSlotItem(hauler) != null || (hauler?.HasCond("IsDragging") ?? false);
+            var activeDragContainer = VanillaHaulBatcher.GetDragSlotItem(hauler);
+            var dragSlotOccupied = activeDragContainer != null || (hauler?.HasCond("IsDragging") ?? false);
             var candidates = FindCarriedContainers(hauler);
             if (candidates.Count == 0)
             {
@@ -2293,11 +2927,23 @@ namespace OstranautsHaulingV2
                 return false;
             }
 
-            plan = new CarriedContainerPlan(candidates, dragSlotOccupied);
+            plan = new CarriedContainerPlan(candidates, dragSlotOccupied, activeDragContainer);
             reason = "";
-            Plugin.ModInfo("[V2CarryContainers] hauler=" + VanillaHaulBatcherSafeCO(hauler)
-                + " " + plan.Description);
+            if (log)
+            {
+                Plugin.ModInfo("[V2CarryContainers] hauler=" + VanillaHaulBatcherSafeCO(hauler)
+                    + " " + plan.Description);
+            }
+
             return true;
+        }
+
+        internal bool IsActiveDragContainer(CondOwner item)
+        {
+            return item != null
+                && HasActiveDragContainer
+                && !string.IsNullOrEmpty(item.strID)
+                && string.Equals(item.strID, _activeDragContainerID, StringComparison.OrdinalIgnoreCase);
         }
 
         internal bool TryAddPlannedContainer(CondOwner item, string source, out string reason)
@@ -2465,6 +3111,24 @@ namespace OstranautsHaulingV2
                 score += Math.Max(0, item.objContainer.gridLayout.gridMaxX * item.objContainer.gridLayout.gridMaxY);
 
             return score;
+        }
+
+        private static int CompareContainerCandidates(ContainerCandidate a, ContainerCandidate b, string activeDragContainerID)
+        {
+            var aActive = IsCandidate(a, activeDragContainerID);
+            var bActive = IsCandidate(b, activeDragContainerID);
+            if (aActive != bActive)
+                return aActive ? -1 : 1;
+
+            return b.Score.CompareTo(a.Score);
+        }
+
+        private static bool IsCandidate(ContainerCandidate candidate, string itemID)
+        {
+            return candidate?.Owner != null
+                && !string.IsNullOrEmpty(itemID)
+                && !string.IsNullOrEmpty(candidate.Owner.strID)
+                && string.Equals(candidate.Owner.strID, itemID, StringComparison.OrdinalIgnoreCase);
         }
 
         private static string ChooseFailureReason(List<string> reasons)
