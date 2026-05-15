@@ -17,12 +17,19 @@ namespace OstranautsHaulingV2
         Drag
     }
 
+    internal enum BigHaulHelperSlot
+    {
+        None,
+        Hand,
+        Drag
+    }
+
     [BepInPlugin(PluginGuid, PluginName, PluginVersion)]
     public sealed class Plugin : BaseUnityPlugin
     {
         internal const string PluginGuid = "com.dezgard.ostranauts.haulingv2";
         internal const string PluginName = "BIG Better Inventory Game";
-        internal const string PluginVersion = "0.9.0";
+        internal const string PluginVersion = "0.9.5";
         internal const string BigHaulInteraction = "BIGHaulItems";
         internal const string BigHaulMarkerIcon = "BIGIcoHaulMarked";
         private const string LooseButtonIcon = "BIGGUIHaulCart";
@@ -1465,6 +1472,10 @@ namespace OstranautsHaulingV2
             var canDrag = CanDragWorldObject(item);
             var looseHaulItem = IsLooseHaulItem(item, out var looseRejectReason);
             var helperHaulItem = IsHelperHaulItem(hauler, item, out var helperRejectReason);
+            BigHaulHelperSlot helperSlot;
+            string sessionHelperReason;
+            var sessionHelper = IsSessionHelperCandidate(item, out helperSlot, out sessionHelperReason);
+            var waitingForHelper = IsHaulCandidateIgnoringCurrentCapacity(item, out var waitingReason);
 
             switch (mode)
             {
@@ -1475,10 +1486,22 @@ namespace OstranautsHaulingV2
                     if (helperHaulItem)
                         return true;
 
-                    reason = helperRejectReason ?? looseRejectReason;
+                    if (sessionHelper)
+                        return true;
+
+                    if (waitingForHelper)
+                        return true;
+
+                    reason = sessionHelperReason ?? helperRejectReason ?? waitingReason ?? looseRejectReason;
                     return false;
 
                 case BigHaulPaintMode.Drag:
+                    if (helperSlot != BigHaulHelperSlot.None)
+                    {
+                        reason = "crate/dolly helper belongs to BIG HAUL";
+                        return false;
+                    }
+
                     if (looseHaulItem)
                     {
                         reason = "loose item belongs to BIG HAUL";
@@ -1537,13 +1560,13 @@ namespace OstranautsHaulingV2
                 return false;
             }
 
-            if (HasAnyCond(item, "IsContainer", "IsCrate", "IsDolly"))
+            if (HasAnyCond(item, "IsCrate", "IsDolly"))
             {
-                reason = "container/helper item is not helper cargo";
+                reason = "crate/dolly helper item is not cargo";
                 return false;
             }
 
-            reason = "helper cargo waiting for helper space";
+            reason = "helper cargo waiting for crate/dolly space";
             return true;
         }
 
@@ -1732,9 +1755,9 @@ namespace OstranautsHaulingV2
                 return false;
             }
 
-            if (HasAnyCond(item, "IsContainer", "IsCrate", "IsDolly"))
+            if (HasAnyCond(item, "IsCrate", "IsDolly"))
             {
-                reason = "container/helper item is not helper cargo";
+                reason = "crate/dolly helper item is not cargo";
                 return false;
             }
 
@@ -1746,6 +1769,243 @@ namespace OstranautsHaulingV2
             }
 
             return true;
+        }
+
+        internal static BigHaulHelperSlot GetSessionHelperSlot(CondOwner item)
+        {
+            if (HasAnyCond(item, "IsDolly"))
+                return BigHaulHelperSlot.Drag;
+
+            if (HasAnyCond(item, "IsCrate"))
+                return BigHaulHelperSlot.Hand;
+
+            return BigHaulHelperSlot.None;
+        }
+
+        internal static bool IsSessionHelperCandidate(CondOwner item, out BigHaulHelperSlot slot, out string reason)
+        {
+            reason = null;
+            slot = GetSessionHelperSlot(item);
+
+            if (slot == BigHaulHelperSlot.None)
+                return false;
+
+            if (item == null)
+            {
+                reason = "null helper";
+                return false;
+            }
+
+            if (item.bDestroyed)
+            {
+                reason = "destroyed helper";
+                return false;
+            }
+
+            if (HasAnyCond(item, "IsInstalled", "IsCarried", "IsSystem", "IsHuman", "IsRobot"))
+            {
+                reason = "helper installed/carried/system/person";
+                return false;
+            }
+
+            if (!IsDirectWorldObject(item, out reason))
+                return false;
+
+            return IsEmptySessionHelper(item, slot, out reason);
+        }
+
+        internal static bool IsEmptySessionHelper(CondOwner item, BigHaulHelperSlot slot, out string reason)
+        {
+            reason = null;
+
+            if (!IsHaulHelper(item))
+            {
+                reason = "not a crate/dolly container helper";
+                return false;
+            }
+
+            if (slot == BigHaulHelperSlot.Hand && !HasAnyCond(item, "IsCrate"))
+            {
+                reason = "helper is not a hand crate";
+                return false;
+            }
+
+            if (slot == BigHaulHelperSlot.Drag && !HasAnyCond(item, "IsDolly"))
+            {
+                reason = "helper is not a drag dolly";
+                return false;
+            }
+
+            if (slot == BigHaulHelperSlot.Hand && !HasAnyPickupInteraction(item))
+            {
+                reason = "hand helper missing pickup interaction";
+                return false;
+            }
+
+            if (slot == BigHaulHelperSlot.Drag && !CanDragWorldObject(item))
+            {
+                reason = "drag helper missing drag interaction";
+                return false;
+            }
+
+            int cargoCount;
+            if (!IsHaulHelperEmpty(item, out cargoCount, out reason))
+                return false;
+
+            reason = "empty " + slot.ToString().ToLowerInvariant() + " helper";
+            return true;
+        }
+
+        internal static bool IsHaulHelperEmpty(CondOwner helper, out int cargoCount, out string reason)
+        {
+            cargoCount = 0;
+            reason = null;
+
+            try
+            {
+                if (helper == null || helper.objContainer == null)
+                {
+                    reason = "helper has no container";
+                    return false;
+                }
+
+                var seen = new HashSet<string>();
+                foreach (var candidate in helper.GetCOsSafe(true))
+                {
+                    var head = candidate != null && candidate.coStackHead != null ? candidate.coStackHead : candidate;
+                    if (head == null || head == helper || head.bDestroyed)
+                        continue;
+
+                    if (!IsDirectCargoOfHelper(head, helper))
+                        continue;
+
+                    var id = SafeValue(() => head.strID);
+                    if (!string.IsNullOrEmpty(id) && id != "<null>" && !seen.Add(id))
+                        continue;
+
+                    cargoCount++;
+                }
+
+                if (cargoCount > 0)
+                {
+                    reason = "helper is not empty cargo=" + cargoCount;
+                    return false;
+                }
+
+                reason = "helper empty";
+                return true;
+            }
+            catch (Exception ex)
+            {
+                reason = "empty helper scan failed: " + ex.Message;
+                return false;
+            }
+        }
+
+        internal static bool CanSessionHelperFitItem(CondOwner helper, CondOwner item, out string reason)
+        {
+            reason = "helper cannot fit item";
+
+            try
+            {
+                if (helper == null || item == null)
+                {
+                    reason = "missing helper or item";
+                    return false;
+                }
+
+                if (!IsHaulHelper(helper))
+                {
+                    reason = "not a haul helper";
+                    return false;
+                }
+
+                if (helper.objContainer != null && helper.objContainer.CanFit(item, false, false))
+                {
+                    reason = "fits helper " + SafeName(helper);
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                reason = "helper fit check failed: " + ex.Message;
+                return false;
+            }
+
+            reason = "helper cannot fit item";
+            return false;
+        }
+
+        internal static bool CanAcquireSessionHelper(CondOwner hauler, CondOwner helper, BigHaulHelperSlot slot, out string reason)
+        {
+            reason = null;
+
+            if (hauler == null || helper == null)
+            {
+                reason = "missing hauler or helper";
+                return false;
+            }
+
+            if (slot == BigHaulHelperSlot.Hand)
+                return CanFitHandHelper(hauler, helper, out reason);
+
+            if (slot == BigHaulHelperSlot.Drag)
+            {
+                if (GetDragSlotItemForHauler(hauler) == null && !HasAnyCond(hauler, "IsDragging"))
+                {
+                    reason = "drag slot free";
+                    return true;
+                }
+
+                reason = "drag slot occupied";
+                return false;
+            }
+
+            reason = "unknown helper slot";
+            return false;
+        }
+
+        internal static CondOwner GetDragSlotItemForHauler(CondOwner hauler)
+        {
+            try
+            {
+                return hauler?.compSlots?.GetSlot("drag")?.GetOutermostCO();
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static bool CanFitHandHelper(CondOwner hauler, CondOwner helper, out string reason)
+        {
+            reason = "no free hand slot";
+
+            try
+            {
+                if (hauler == null || helper == null || hauler.compSlots == null)
+                {
+                    reason = "missing hand slots";
+                    return false;
+                }
+
+                foreach (var slotName in new[] { "heldL", "heldR", "handL", "handR" })
+                {
+                    var slot = hauler.compSlots.GetSlot(slotName);
+                    if (slot != null && slot.CanFit(helper, false, true))
+                    {
+                        reason = "fits " + slotName;
+                        return true;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                reason = "hand helper fit failed: " + ex.Message;
+                return false;
+            }
+
+            return false;
         }
 
         internal static Interaction GetPickupInteractionForLooseItem(CondOwner item)
@@ -1945,55 +2205,60 @@ namespace OstranautsHaulingV2
             if (hauler == null)
                 return result;
 
-            CondOwner dragItem = null;
+            AddExplicitSlotItem(result, hauler, "drag");
+            AddExplicitSlotItem(result, hauler, "heldL");
+            AddExplicitSlotItem(result, hauler, "heldR");
+            AddExplicitSlotItem(result, hauler, "handL");
+            AddExplicitSlotItem(result, hauler, "handR");
+
+            return result;
+        }
+
+        private static void AddExplicitSlotItem(List<CondOwner> result, CondOwner hauler, string slotName)
+        {
             try
             {
-                dragItem = hauler.compSlots?.GetSlot("drag")?.GetOutermostCO();
+                if (result == null || hauler?.compSlots == null || string.IsNullOrEmpty(slotName))
+                    return;
+
+                var item = hauler.compSlots.GetSlot(slotName)?.GetOutermostCO();
+                if (item == null)
+                    return;
+
+                var id = SafeValue(() => item.strID);
+                if (!string.IsNullOrEmpty(id) && id != "<null>" && result.Any(existing => SafeValue(() => existing.strID) == id))
+                    return;
+
+                result.Add(item);
             }
             catch
             {
-                dragItem = null;
             }
+        }
 
-            if (dragItem != null)
-                result.Add(dragItem);
-
+        internal static string GetActiveHaulHelperSlotName(CondOwner hauler, CondOwner helper)
+        {
             try
             {
-                if (hauler.compSlots != null)
+                if (hauler?.compSlots == null || helper == null)
+                    return "<none>";
+
+                var helperId = SafeValue(() => helper.strID);
+                foreach (var slotName in new[] { "drag", "heldL", "heldR", "handL", "handR" })
                 {
-                    foreach (var slot in hauler.compSlots.GetSlotsHeldFirst(true))
-                    {
-                        var item = slot?.GetOutermostCO();
-                        if (item != null)
-                            result.Add(item);
-                    }
+                    var item = hauler.compSlots.GetSlot(slotName)?.GetOutermostCO();
+                    if (item == null)
+                        continue;
+
+                    if (!string.IsNullOrEmpty(helperId) && helperId != "<null>" && SafeValue(() => item.strID) == helperId)
+                        return slotName;
                 }
             }
             catch
             {
             }
 
-            IEnumerable<CondOwner> carried = null;
-            try
-            {
-                carried = hauler.GetCOsSafe(true);
-            }
-            catch
-            {
-                carried = null;
-            }
-
-            if (carried == null)
-                return result;
-
-            foreach (var item in carried)
-            {
-                if (item != null)
-                    result.Add(item);
-            }
-
-            return result;
+            return "<none>";
         }
 
         private static bool IsHaulHelper(CondOwner item)
@@ -2227,6 +2492,9 @@ namespace OstranautsHaulingV2
     internal static class BigHaulPlanner
     {
         private const int MaxSessionItems = 200;
+        private const int MaxDragDropSearchAttempts = 40;
+        private const int AnyStockpileZonePenalty = 250000;
+        private const double DragDropSearchRetrySeconds = 1.5;
         private const float OffShipPickupPenalty = 1000000f;
         private static readonly Dictionary<string, BigLooseHaulSession> ActiveSessions = new Dictionary<string, BigLooseHaulSession>();
 
@@ -2276,13 +2544,22 @@ namespace OstranautsHaulingV2
                 return 0;
             }
 
+            var rawSelection = DistinctSelection(items);
             var selected = new List<CondOwner>();
+            var unplanned = new List<CondOwner>();
             var seen = new HashSet<string>();
 
-            foreach (var item in items ?? Enumerable.Empty<CondOwner>())
+            foreach (var item in rawSelection)
             {
-                if (!IsValidPendingItem(hauler, item, mode))
+                if (!IsPlanPendingItem(hauler, item, mode, rawSelection))
+                {
+                    BigHaulHelperSlot helperSlot;
+                    string helperReason;
+                    if (mode != BigHaulPaintMode.Haul || !Plugin.IsSessionHelperCandidate(item, out helperSlot, out helperReason))
+                        unplanned.Add(item);
+
                     continue;
+                }
 
                 var id = SafeId(item);
                 if (string.IsNullOrEmpty(id) || !seen.Add(id))
@@ -2332,15 +2609,26 @@ namespace OstranautsHaulingV2
             if (skippedNoPath > 0)
                 Plugin.Warn("[" + ModeMarker(mode, "PlanFilter") + "] hauler=" + Plugin.SafeName(hauler) + " skippedNoPath=" + skippedNoPath + " planned=" + selected.Count + " backlog=" + backlog.Count + ".");
 
+            foreach (var item in unplanned)
+                BigHaulRegistry.MarkState(item, "SkippedNoRoom", "no suitable inventory/helper capacity before planning");
+
             if (selected.Count == 0)
             {
+                foreach (var helper in rawSelection)
+                {
+                    BigHaulHelperSlot helperSlot;
+                    string helperReason;
+                    if (mode == BigHaulPaintMode.Haul && Plugin.IsSessionHelperCandidate(helper, out helperSlot, out helperReason))
+                        BigHaulRegistry.MarkState(helper, "Cancelled", "no BIG haul cargo planned for helper");
+                }
+
                 Plugin.Warn("[" + ModeMarker(mode, "PlanStart") + "] skipped: no valid items survived filtering.");
                 return 0;
             }
 
             BigLooseHaulSession existing;
             if (ActiveSessions.TryGetValue(haulerId, out existing) && existing != null)
-                return MergeLooseSession(hauler, existing, selected.Concat(backlog).ToList(), mode);
+                return MergeLooseSession(hauler, existing, selected.Concat(backlog).ToList(), mode, rawSelection);
 
             SafeClearQueue(hauler, "start " + mode + " BIG session");
 
@@ -2357,6 +2645,8 @@ namespace OstranautsHaulingV2
             TrackSessionCargoKeys(session, session.Pending);
             TrackSessionCargoKeys(session, session.Backlog);
             CaptureInventoryBaseline(hauler, session, "start");
+            CapturePreExistingHelpers(hauler, session, "start");
+            PlanSessionHelpers(hauler, session, rawSelection, selected.Concat(backlog).ToList(), "start");
 
             ActiveSessions[haulerId] = session;
             Plugin.ModInfo("[" + ModeMarker(mode, "PlanStart") + "] hauler=" + session.HaulerName + " pending=" + session.Pending.Count + " backlog=" + session.Backlog.Count + " queue=" + Plugin.QueueSummary(hauler) + ".");
@@ -2373,12 +2663,13 @@ namespace OstranautsHaulingV2
             return planned;
         }
 
-        private static int MergeLooseSession(CondOwner hauler, BigLooseHaulSession session, List<CondOwner> plannedItems, BigHaulPaintMode mode)
+        private static int MergeLooseSession(CondOwner hauler, BigLooseHaulSession session, List<CondOwner> plannedItems, BigHaulPaintMode mode, List<CondOwner> rawSelection)
         {
             if (hauler == null || session == null || plannedItems == null || plannedItems.Count == 0)
                 return 0;
 
             PruneSession(hauler, session);
+            CapturePreExistingHelpers(hauler, session, "merge");
 
             var addedPending = 0;
             var addedBacklog = 0;
@@ -2386,7 +2677,7 @@ namespace OstranautsHaulingV2
 
             foreach (var item in plannedItems)
             {
-                if (!IsValidPendingItem(hauler, item, mode))
+                if (!IsPlanPendingItem(hauler, item, mode, rawSelection))
                     continue;
 
                 if (SessionContainsItem(session, item))
@@ -2422,6 +2713,8 @@ namespace OstranautsHaulingV2
             if (added <= 0)
                 return 0;
 
+            PlanSessionHelpers(hauler, session, rawSelection, plannedItems, "merge");
+
             if (!IsAutoTaskingEnabled(hauler))
             {
                 if (!session.AutoPausedLogged)
@@ -2453,6 +2746,293 @@ namespace OstranautsHaulingV2
                 return true;
 
             return session.CurrentDrop != null && session.CurrentDrop.Item != null && SafeId(session.CurrentDrop.Item) == id;
+        }
+
+        private static List<CondOwner> DistinctSelection(IEnumerable<CondOwner> items)
+        {
+            var selected = new List<CondOwner>();
+            var seen = new HashSet<string>();
+
+            foreach (var item in items ?? Enumerable.Empty<CondOwner>())
+            {
+                if (item == null)
+                    continue;
+
+                var id = SafeId(item);
+                if (!string.IsNullOrEmpty(id) && !seen.Add(id))
+                    continue;
+
+                selected.Add(item);
+            }
+
+            return selected;
+        }
+
+        private static bool IsPlanPendingItem(CondOwner hauler, CondOwner item, BigHaulPaintMode mode, List<CondOwner> rawSelection)
+        {
+            if (item == null)
+                return false;
+
+            BigHaulHelperSlot helperSlot;
+            string helperReason;
+            if (mode == BigHaulPaintMode.Haul && Plugin.IsSessionHelperCandidate(item, out helperSlot, out helperReason))
+                return false;
+
+            if (mode != BigHaulPaintMode.Haul)
+                return IsValidPendingItem(hauler, item, mode);
+
+            string looseReason;
+            if (Plugin.IsLooseWorldHaulCandidate(item, out looseReason))
+                return true;
+
+            string fitReason;
+            string waitingReason;
+            if (Plugin.IsHaulCandidateIgnoringCurrentCapacity(item, out waitingReason)
+                && (CanAcquireNext(hauler, item, mode, out fitReason) || HasPotentialHaulHelperForItem(hauler, item, rawSelection, out fitReason)))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool HasPotentialHaulHelperForItem(CondOwner hauler, CondOwner item, List<CondOwner> rawSelection, out string reason)
+        {
+            reason = "no potential helper";
+
+            string fitReason;
+            if (Plugin.CanFitHaulHelper(hauler, item, out fitReason))
+            {
+                reason = fitReason;
+                return true;
+            }
+
+            foreach (var helper in rawSelection ?? new List<CondOwner>())
+            {
+                BigHaulHelperSlot slot;
+                string helperReason;
+                if (!Plugin.IsSessionHelperCandidate(helper, out slot, out helperReason))
+                    continue;
+
+                if (Plugin.CanSessionHelperFitItem(helper, item, out fitReason))
+                {
+                    reason = "selected " + slot.ToString().ToLowerInvariant() + " helper can fit item";
+                    return true;
+                }
+            }
+
+            foreach (var helper in FindSameShipSessionHelpers(hauler, null))
+            {
+                if (Plugin.CanSessionHelperFitItem(helper.Item, item, out fitReason))
+                {
+                    reason = "same-ship " + helper.Slot.ToString().ToLowerInvariant() + " helper can fit item";
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static void CapturePreExistingHelpers(CondOwner hauler, BigLooseHaulSession session, string reason)
+        {
+            try
+            {
+                if (hauler == null || session == null || session.Mode != BigHaulPaintMode.Haul || session.PreExistingHelpersCaptured)
+                    return;
+
+                var added = 0;
+                foreach (var helper in Plugin.GetHaulHelpersForHauler(hauler))
+                {
+                    var id = SafeId(helper);
+                    if (string.IsNullOrEmpty(id))
+                        continue;
+
+                    if (Plugin.GetSessionHelperSlot(helper) == BigHaulHelperSlot.None)
+                        continue;
+
+                    if (session.PreExistingHelperIds.Add(id))
+                        added++;
+                }
+
+                session.PreExistingHelpersCaptured = true;
+                if (added > 0)
+                    Plugin.ModInfo("[BIGHelperBaseline] hauler=" + Plugin.SafeName(hauler) + " reason=" + reason + " preExisting=" + added + ".");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Warn("[BIGHelperBaseline] failed: hauler=" + Plugin.SafeName(hauler) + " reason=" + reason + " error=" + ex.Message);
+            }
+        }
+
+        private static void PlanSessionHelpers(CondOwner hauler, BigLooseHaulSession session, List<CondOwner> rawSelection, List<CondOwner> plannedCargo, string reason)
+        {
+            try
+            {
+                if (hauler == null || session == null || session.Mode != BigHaulPaintMode.Haul)
+                    return;
+
+                var excludeIds = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var cargo in plannedCargo ?? new List<CondOwner>())
+                {
+                    var id = SafeId(cargo);
+                    if (!string.IsNullOrEmpty(id))
+                        excludeIds.Add(id);
+                }
+
+                var selectedAdded = 0;
+                foreach (var helper in rawSelection ?? new List<CondOwner>())
+                {
+                    var id = SafeId(helper);
+                    if (string.IsNullOrEmpty(id) || excludeIds.Contains(id))
+                        continue;
+
+                    BigHaulHelperSlot slot;
+                    string helperReason;
+                    if (!Plugin.IsSessionHelperCandidate(helper, out slot, out helperReason))
+                        continue;
+
+                    string fitReason;
+                    if (!HelperCanFitAnyPlannedCargo(helper, plannedCargo, out fitReason))
+                        continue;
+
+                    if (TryAddHelperCandidate(hauler, session, helper, slot, "selected-" + reason + ":" + fitReason))
+                        selectedAdded++;
+                }
+
+                var shipAdded = 0;
+                foreach (var helper in FindSameShipSessionHelpers(hauler, excludeIds))
+                {
+                    string fitReason;
+                    if (!HelperCanFitAnyPlannedCargo(helper.Item, plannedCargo, out fitReason))
+                        continue;
+
+                    if (TryAddHelperCandidate(hauler, session, helper.Item, helper.Slot, "same-ship-" + reason + ":" + fitReason))
+                        shipAdded++;
+                }
+
+                if (selectedAdded > 0 || shipAdded > 0)
+                {
+                    Plugin.ModInfo("[BIGHelperPlan] hauler=" + Plugin.SafeName(hauler)
+                        + " reason=" + reason
+                        + " selected=" + selectedAdded
+                        + " sameShip=" + shipAdded
+                        + " handCandidates=" + session.HandHelperCandidates.Count
+                        + " dragCandidates=" + session.DragHelperCandidates.Count + ".");
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Warn("[BIGHelperPlan] failed: hauler=" + Plugin.SafeName(hauler) + " reason=" + reason + " error=" + ex.Message);
+            }
+        }
+
+        private static bool HelperCanFitAnyPlannedCargo(CondOwner helper, List<CondOwner> plannedCargo, out string reason)
+        {
+            reason = "no planned cargo fits helper";
+
+            foreach (var cargo in plannedCargo ?? new List<CondOwner>())
+            {
+                if (cargo == null || cargo.bDestroyed)
+                    continue;
+
+                if (Plugin.GetSessionHelperSlot(cargo) != BigHaulHelperSlot.None)
+                    continue;
+
+                string fitReason;
+                if (Plugin.CanSessionHelperFitItem(helper, cargo, out fitReason))
+                {
+                    reason = "fits " + Plugin.SafeName(cargo);
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool TryAddHelperCandidate(CondOwner hauler, BigLooseHaulSession session, CondOwner helper, BigHaulHelperSlot slot, string source)
+        {
+            if (hauler == null || session == null || helper == null || slot == BigHaulHelperSlot.None)
+                return false;
+
+            var id = SafeId(helper);
+            if (string.IsNullOrEmpty(id))
+                return false;
+
+            if (session.PreExistingHelperIds.Contains(id) || session.SessionOwnedHelperIds.Contains(id) || session.HelperAcquireFailedIds.Contains(id))
+                return false;
+
+            var list = slot == BigHaulHelperSlot.Drag ? session.DragHelperCandidates : session.HandHelperCandidates;
+            if (ContainsSame(list, helper))
+                return false;
+
+            list.Add(helper);
+            BigHaulRegistry.Register(hauler, helper, BigHaulPaintMode.Haul);
+            BigHaulRegistry.MarkState(helper, "HelperQueued", "BIG helper queued from " + source);
+            return true;
+        }
+
+        private static List<SessionHelperCandidate> FindSameShipSessionHelpers(CondOwner hauler, HashSet<string> excludeIds)
+        {
+            var helpers = new List<SessionHelperCandidate>();
+
+            try
+            {
+                if (hauler == null || DataHandler.mapCOs == null)
+                    return helpers;
+
+                foreach (var helper in DataHandler.mapCOs.Values.ToList())
+                {
+                    if (helper == null || helper == hauler)
+                        continue;
+
+                    var id = SafeId(helper);
+                    if (!string.IsNullOrEmpty(id) && excludeIds != null && excludeIds.Contains(id))
+                        continue;
+
+                    if (!IsSameShip(hauler, helper))
+                        continue;
+
+                    BigHaulHelperSlot slot;
+                    string helperReason;
+                    if (!Plugin.IsSessionHelperCandidate(helper, out slot, out helperReason))
+                        continue;
+
+                    var score = HelperPickupScore(hauler, helper, slot);
+                    if (score >= float.MaxValue * 0.5f)
+                        continue;
+
+                    helpers.Add(new SessionHelperCandidate
+                    {
+                        Item = helper,
+                        Slot = slot,
+                        Score = score
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Warn("[BIGHelperScan] failed: hauler=" + Plugin.SafeName(hauler) + " error=" + ex.Message);
+            }
+
+            return helpers
+                .GroupBy(candidate => SafeId(candidate.Item))
+                .Select(group => group.OrderBy(candidate => candidate.Score).First())
+                .OrderBy(candidate => candidate.Score)
+                .ToList();
+        }
+
+        private static float HelperPickupScore(CondOwner hauler, CondOwner helper, BigHaulHelperSlot slot)
+        {
+            string reason;
+            var pickup = slot == BigHaulHelperSlot.Drag
+                ? Plugin.GetDragStartInteraction(hauler, helper, out reason)
+                : Plugin.GetPickupInteractionForLooseItem(helper);
+
+            if (pickup == null)
+                return float.MaxValue;
+
+            pickup.bManual = true;
+            return PickupSortScore(hauler, helper, pickup);
         }
 
         internal static void PumpSelectedCrew()
@@ -2494,6 +3074,12 @@ namespace OstranautsHaulingV2
 
             for (var guard = 0; guard < 16; guard++)
             {
+                if (session.CurrentHelperAcquire != null)
+                {
+                    FinishHelperAcquire(hauler, session);
+                    continue;
+                }
+
                 if (session.CurrentPickup != null)
                 {
                     FinishPickup(hauler, session);
@@ -2522,9 +3108,15 @@ namespace OstranautsHaulingV2
                         return;
                     }
 
+                    if (TryQueueFinalHelperRelease(hauler, session))
+                        return;
+
                     CompleteSession(hauler, session, "all items handled");
                     return;
                 }
+
+                if (session.Carried.Count == 0 && TryQueueNextHelperAcquire(hauler, session))
+                    return;
 
                 if (session.DropPhase && session.Carried.Count > 0)
                 {
@@ -2557,6 +3149,9 @@ namespace OstranautsHaulingV2
                         QueueNextDrop(hauler, session);
                         return;
                     }
+
+                    if (TryQueueFinalHelperRelease(hauler, session))
+                        return;
 
                     CompleteSession(hauler, session, "no reachable pending items");
                     return;
@@ -2591,8 +3186,204 @@ namespace OstranautsHaulingV2
             if (head == null || head.bDestroyed || ContainsSame(session.Carried, head))
                 return;
 
+            if (Plugin.GetSessionHelperSlot(head) != BigHaulHelperSlot.None)
+                return;
+
+            if (IsDropFailed(session, head))
+                return;
+
             session.Carried.Add(head);
             Plugin.ModInfo("[BIGDragCarrySync] hauler=" + Plugin.SafeName(hauler) + " reason=" + reason + " existingDrag=" + Plugin.Describe(head) + " carried=" + session.Carried.Count + ".");
+        }
+
+        private static bool TryQueueNextHelperAcquire(CondOwner hauler, BigLooseHaulSession session)
+        {
+            if (hauler == null || session == null || session.Mode != BigHaulPaintMode.Haul)
+                return false;
+
+            if (session.Pending.Count == 0 && session.Backlog.Count == 0)
+                return false;
+
+            PruneHelperCandidates(session);
+
+            if (!HasActiveHelperForSlot(hauler, BigHaulHelperSlot.Hand)
+                && TryQueueHelperCandidateFromList(hauler, session, session.HandHelperCandidates, BigHaulHelperSlot.Hand))
+            {
+                return true;
+            }
+
+            if (!HasActiveHelperForSlot(hauler, BigHaulHelperSlot.Drag)
+                && TryQueueHelperCandidateFromList(hauler, session, session.DragHelperCandidates, BigHaulHelperSlot.Drag))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryQueueHelperCandidateFromList(CondOwner hauler, BigLooseHaulSession session, List<CondOwner> helpers, BigHaulHelperSlot slot)
+        {
+            if (helpers == null || helpers.Count == 0)
+                return false;
+
+            while (helpers.Count > 0)
+            {
+                var helper = helpers[0];
+                helpers.RemoveAt(0);
+
+                var id = SafeId(helper);
+                if (string.IsNullOrEmpty(id) || session.HelperAcquireFailedIds.Contains(id) || session.SessionOwnedHelperIds.Contains(id))
+                    continue;
+
+                string candidateReason;
+                BigHaulHelperSlot currentSlot;
+                if (!Plugin.IsSessionHelperCandidate(helper, out currentSlot, out candidateReason) || currentSlot != slot)
+                {
+                    MarkHelperAcquireFailed(session, helper, "helper candidate invalid: " + candidateReason, "SkippedNoRoom");
+                    continue;
+                }
+
+                string fitReason;
+                if (!Plugin.CanAcquireSessionHelper(hauler, helper, slot, out fitReason))
+                {
+                    MarkHelperAcquireFailed(session, helper, "cannot equip helper: " + fitReason, "SkippedNoRoom");
+                    Plugin.Warn("[BIGHelperAcquireSkip] hauler=" + Plugin.SafeName(hauler) + " helper=" + Plugin.Describe(helper) + " slot=" + slot + " reason=" + fitReason + ".");
+                    continue;
+                }
+
+                string pickupReason = null;
+                var pickup = slot == BigHaulHelperSlot.Drag
+                    ? Plugin.GetDragStartInteraction(hauler, helper, out pickupReason)
+                    : Plugin.GetPickupInteractionForLooseItem(helper);
+
+                if (pickup == null)
+                {
+                    MarkHelperAcquireFailed(session, helper, "helper acquire interaction missing: " + pickupReason, "SkippedNoPath");
+                    Plugin.Warn("[BIGHelperAcquireSkip] hauler=" + Plugin.SafeName(hauler) + " helper=" + Plugin.Describe(helper) + " slot=" + slot + " reason=no-interaction.");
+                    continue;
+                }
+
+                pickup.bManual = true;
+                if (!hauler.QueueInteraction(helper, pickup))
+                {
+                    MarkHelperAcquireFailed(session, helper, "helper acquire queue refused", "SkippedNoPath");
+                    Plugin.Warn("[BIGHelperQueue] failed: hauler=" + Plugin.SafeName(hauler) + " helper=" + Plugin.Describe(helper) + " slot=" + slot + " queue=" + Plugin.QueueSummary(hauler) + ".");
+                    continue;
+                }
+
+                session.CurrentHelperAcquire = helper;
+                session.CurrentHelperSlot = slot;
+                Plugin.ModInfo("[BIGHelperQueue] hauler=" + Plugin.SafeName(hauler)
+                    + " helper=" + Plugin.Describe(helper)
+                    + " slot=" + slot
+                    + " fit=" + fitReason
+                    + " pending=" + session.Pending.Count
+                    + " backlog=" + session.Backlog.Count
+                    + " queue=" + Plugin.QueueSummary(hauler) + ".");
+                return true;
+            }
+
+            return false;
+        }
+
+        private static void FinishHelperAcquire(CondOwner hauler, BigLooseHaulSession session)
+        {
+            var helper = session.CurrentHelperAcquire;
+            var slot = session.CurrentHelperSlot;
+            session.CurrentHelperAcquire = null;
+            session.CurrentHelperSlot = BigHaulHelperSlot.None;
+
+            if (helper == null || helper.bDestroyed)
+            {
+                Plugin.Warn("[BIGHelperAcquired] helper vanished. hauler=" + Plugin.SafeName(hauler) + ".");
+                return;
+            }
+
+            var owned = ResolveOwnedCarried(hauler, helper);
+            if (slot == BigHaulHelperSlot.Drag)
+            {
+                var dragged = GetDragSlotItem(hauler);
+                if (SameItem(dragged, helper))
+                    owned = dragged;
+            }
+
+            if (owned != null && (IsOwnedByHauler(hauler, owned) || (slot == BigHaulHelperSlot.Drag && SameItem(GetDragSlotItem(hauler), owned))))
+            {
+                var id = SafeId(owned);
+                if (!string.IsNullOrEmpty(id))
+                    session.SessionOwnedHelperIds.Add(id);
+
+                BigHaulRegistry.MarkState(owned, "HelperAcquired", "BIG helper acquired for smart haul");
+                Plugin.ModInfo("[BIGHelperAcquired] hauler=" + Plugin.SafeName(hauler)
+                    + " helper=" + Plugin.Describe(owned)
+                    + " slot=" + slot
+                    + " ownedHelpers=" + session.SessionOwnedHelperIds.Count + ".");
+                return;
+            }
+
+            MarkHelperAcquireFailed(session, helper, "helper not owned after acquire", "SkippedNoPath");
+            Plugin.Warn("[BIGHelperAcquired] helper was not found on hauler. hauler=" + Plugin.SafeName(hauler) + " helper=" + Plugin.Describe(helper) + " slot=" + slot + ".");
+        }
+
+        private static bool HasActiveHelperForSlot(CondOwner hauler, BigHaulHelperSlot slot)
+        {
+            try
+            {
+                foreach (var helper in Plugin.GetHaulHelpersForHauler(hauler))
+                {
+                    if (Plugin.GetSessionHelperSlot(helper) == slot)
+                        return true;
+                }
+            }
+            catch
+            {
+            }
+
+            return false;
+        }
+
+        private static void PruneHelperCandidates(BigLooseHaulSession session)
+        {
+            if (session == null)
+                return;
+
+            session.HandHelperCandidates = PruneHelperCandidateList(session, session.HandHelperCandidates, BigHaulHelperSlot.Hand);
+            session.DragHelperCandidates = PruneHelperCandidateList(session, session.DragHelperCandidates, BigHaulHelperSlot.Drag);
+        }
+
+        private static List<CondOwner> PruneHelperCandidateList(BigLooseHaulSession session, List<CondOwner> helpers, BigHaulHelperSlot slot)
+        {
+            var result = new List<CondOwner>();
+            var seen = new HashSet<string>();
+
+            foreach (var helper in helpers ?? new List<CondOwner>())
+            {
+                var id = SafeId(helper);
+                if (string.IsNullOrEmpty(id) || !seen.Add(id))
+                    continue;
+
+                if (session.HelperAcquireFailedIds.Contains(id) || session.SessionOwnedHelperIds.Contains(id) || session.PreExistingHelperIds.Contains(id))
+                    continue;
+
+                BigHaulHelperSlot currentSlot;
+                string reason;
+                if (!Plugin.IsSessionHelperCandidate(helper, out currentSlot, out reason) || currentSlot != slot)
+                    continue;
+
+                result.Add(helper);
+            }
+
+            return result;
+        }
+
+        private static void MarkHelperAcquireFailed(BigLooseHaulSession session, CondOwner helper, string reason, string state)
+        {
+            var id = SafeId(helper);
+            if (!string.IsNullOrEmpty(id))
+                session.HelperAcquireFailedIds.Add(id);
+
+            if (helper != null)
+                BigHaulRegistry.MarkState(helper, state, reason);
         }
 
         private static void QueuePickup(CondOwner hauler, BigLooseHaulSession session, CondOwner item)
@@ -2730,13 +3521,21 @@ namespace OstranautsHaulingV2
                 return false;
 
             var item = session.Carried[0];
+            if (session.Mode == BigHaulPaintMode.Drag && IsDropSearchCoolingDown(session, item))
+                return false;
+
             DropPlan plan;
-            if (!TryFindDropPlan(hauler, item, out plan))
+            if (!TryFindDropPlan(hauler, item, out plan)
+                && !(session.Mode == BigHaulPaintMode.Drag && TryFindDropPlan(hauler, item, out plan, true)))
             {
-                Plugin.Warn("[BIGDropNoTarget] hauler=" + Plugin.SafeName(hauler) + " item=" + Plugin.Describe(item) + " pending=" + session.Pending.Count + " carried=" + session.Carried.Count + ".");
+                if (TryDeferDragDropSearch(hauler, session, item, "no valid stockpile tile for item footprint"))
+                    return false;
+
+                MarkDropFailed(hauler, session, item, "no valid stockpile tile for item footprint");
                 return false;
             }
 
+            ClearDropSearchState(session, item);
             plan.Item = item;
             session.CurrentDrop = plan;
 
@@ -2758,6 +3557,203 @@ namespace OstranautsHaulingV2
             return true;
         }
 
+        private static void MarkDropFailed(CondOwner hauler, BigLooseHaulSession session, CondOwner item, string reason)
+        {
+            if (session == null || item == null)
+                return;
+
+            var failed = StackHead(item) ?? item;
+            var id = SafeId(failed);
+            if (!string.IsNullOrEmpty(id))
+                session.FailedDropIds.Add(id);
+
+            RemoveSame(session.Carried, failed);
+            RemoveSame(session.Carried, item);
+            RemoveSame(session.Pending, failed);
+            RemoveSame(session.Pending, item);
+            RemoveSame(session.Backlog, failed);
+            RemoveSame(session.Backlog, item);
+
+            BigHaulRegistry.MarkState(failed, "SkippedNoPath", "drop target unavailable: " + reason);
+            Plugin.Warn("[BIGDropNoTarget] hauler=" + Plugin.SafeName(hauler)
+                + " item=" + Plugin.Describe(failed)
+                + " reason=" + reason
+                + " action=marked-failed"
+                + " pending=" + session.Pending.Count
+                + " backlog=" + session.Backlog.Count
+                + " carried=" + session.Carried.Count + ".");
+
+            if (session.Mode == BigHaulPaintMode.Drag && SameItem(GetDragSlotItem(hauler), failed))
+            {
+                foreach (var pending in session.Pending.ToList())
+                    BigHaulRegistry.MarkState(pending, "Cancelled", "drag session blocked by undroppable carried item");
+
+                foreach (var backlog in session.Backlog.ToList())
+                    BigHaulRegistry.MarkState(backlog, "Cancelled", "drag session blocked by undroppable carried item");
+
+                session.Pending.Clear();
+                session.Backlog.Clear();
+                session.DropPhase = false;
+                CompleteSession(hauler, session, "drag item has no valid drop target");
+                return;
+            }
+
+            ClearDropPhaseIfEmpty(hauler, session);
+        }
+
+        private static bool TryDeferDragDropSearch(CondOwner hauler, BigLooseHaulSession session, CondOwner item, string reason)
+        {
+            if (hauler == null || session == null || session.Mode != BigHaulPaintMode.Drag || item == null)
+                return false;
+
+            var dragged = GetDragSlotItem(hauler);
+            var failed = StackHead(item) ?? item;
+            if (!SameItem(dragged, failed))
+                return false;
+
+            var id = SafeId(failed);
+            if (string.IsNullOrEmpty(id))
+                return false;
+
+            int attempts;
+            session.DropSearchAttempts.TryGetValue(id, out attempts);
+
+            if (attempts >= MaxDragDropSearchAttempts)
+            {
+                if (QueueStopDrag(hauler))
+                {
+                    session.FailedDropIds.Add(id);
+                    RemoveSame(session.Carried, failed);
+                    RemoveSame(session.Pending, failed);
+                    RemoveSame(session.Backlog, failed);
+                    session.DropPhase = false;
+                    ClearDropSearchState(session, failed);
+                    BigHaulRegistry.MarkState(failed, "SkippedNoPath", "drop target unavailable after drag drop search");
+                    Plugin.Warn("[BIGDragDropSearch] hauler=" + Plugin.SafeName(hauler)
+                        + " item=" + Plugin.Describe(failed)
+                        + " reason=" + reason
+                        + " attempts=" + attempts
+                        + " action=stop-drag-and-skip"
+                        + " pending=" + session.Pending.Count
+                        + " backlog=" + session.Backlog.Count + ".");
+                    return true;
+                }
+
+                return false;
+            }
+
+            attempts++;
+            session.DropSearchAttempts[id] = attempts;
+            session.NextDropSearchAtUtc[id] = DateTime.UtcNow.AddSeconds(DragDropSearchRetrySeconds);
+
+            if (attempts == 1 || attempts % 10 == 0)
+            {
+                Plugin.Warn("[BIGDragDropSearch] hauler=" + Plugin.SafeName(hauler)
+                    + " item=" + Plugin.Describe(failed)
+                    + " reason=" + reason
+                    + " attempts=" + attempts + "/" + MaxDragDropSearchAttempts
+                    + " action=retry-later"
+                    + " retrySeconds=" + DragDropSearchRetrySeconds.ToString("0.0") + ".");
+            }
+
+            return true;
+        }
+
+        private static bool IsDropSearchCoolingDown(BigLooseHaulSession session, CondOwner item)
+        {
+            if (session == null || item == null)
+                return false;
+
+            var id = SafeId(StackHead(item) ?? item);
+            if (string.IsNullOrEmpty(id))
+                return false;
+
+            DateTime next;
+            return session.NextDropSearchAtUtc.TryGetValue(id, out next) && DateTime.UtcNow < next;
+        }
+
+        private static void ClearDropSearchState(BigLooseHaulSession session, CondOwner item)
+        {
+            if (session == null || item == null)
+                return;
+
+            var id = SafeId(StackHead(item) ?? item);
+            if (string.IsNullOrEmpty(id))
+                return;
+
+            session.DropSearchAttempts.Remove(id);
+            session.NextDropSearchAtUtc.Remove(id);
+        }
+
+        private static bool IsDropFailed(BigLooseHaulSession session, CondOwner item)
+        {
+            if (session == null || item == null || session.FailedDropIds.Count == 0)
+                return false;
+
+            var id = SafeId(StackHead(item) ?? item);
+            return !string.IsNullOrEmpty(id) && session.FailedDropIds.Contains(id);
+        }
+
+        private static bool TryQueueFinalHelperRelease(CondOwner hauler, BigLooseHaulSession session)
+        {
+            if (hauler == null || session == null || session.Mode != BigHaulPaintMode.Haul)
+                return false;
+
+            if (session.CurrentPickup != null || session.CurrentDrop != null || session.CurrentHelperAcquire != null)
+                return false;
+
+            if (session.Pending.Count > 0 || session.Backlog.Count > 0)
+                return false;
+
+            SyncCarriedFromHauler(hauler, session, "before-helper-release");
+            if (session.Carried.Count > 0)
+            {
+                session.DropPhase = true;
+                QueueNextDrop(hauler, session);
+                return true;
+            }
+
+            foreach (var helper in FindSessionOwnedHelpers(hauler, session))
+            {
+                DropPlan plan;
+                if (!TryFindDropPlan(hauler, helper.Item, out plan))
+                {
+                    MarkSessionHelperReleased(session, helper.Item, helper.Slot, "no helper drop target", "retained");
+                    Plugin.Warn("[BIGHelperRelease] no drop target; retaining helper. hauler=" + Plugin.SafeName(hauler) + " helper=" + Plugin.Describe(helper.Item) + " slot=" + helper.Slot + ".");
+                    continue;
+                }
+
+                plan.Item = helper.Item;
+                plan.HelperRelease = true;
+                plan.HelperSlot = helper.Slot;
+                session.CurrentDrop = plan;
+                session.DropPhase = true;
+
+                if (!QueueWalkToDrop(hauler, plan))
+                {
+                    session.CurrentDrop = null;
+                    Plugin.Warn("[BIGHelperRelease] failed to queue walk. hauler=" + Plugin.SafeName(hauler) + " helper=" + Plugin.Describe(helper.Item) + " target=" + plan.Summary + ".");
+                    continue;
+                }
+
+                if (helper.Slot == BigHaulHelperSlot.Drag && !QueueStopDrag(hauler))
+                {
+                    session.CurrentDrop = null;
+                    Plugin.Warn("[BIGHelperRelease] failed to queue drag stop. hauler=" + Plugin.SafeName(hauler) + " helper=" + Plugin.Describe(helper.Item) + " target=" + plan.Summary + ".");
+                    return true;
+                }
+
+                Plugin.ModInfo("[BIGHelperRelease] hauler=" + Plugin.SafeName(hauler)
+                    + " helper=" + Plugin.Describe(helper.Item)
+                    + " slot=" + helper.Slot
+                    + " target=" + plan.Summary
+                    + " queue=" + Plugin.QueueSummary(hauler) + ".");
+                return true;
+            }
+
+            return false;
+        }
+
         private static void FinishDrop(CondOwner hauler, BigLooseHaulSession session)
         {
             var plan = session.CurrentDrop;
@@ -2773,6 +3769,14 @@ namespace OstranautsHaulingV2
             if (!IsOwnedByHauler(hauler, item))
             {
                 RemoveSame(session.Carried, item ?? plan.Item);
+                if (plan.HelperRelease && plan.HelperSlot == BigHaulHelperSlot.Drag)
+                {
+                    MarkSessionHelperReleased(session, plan.Item, plan.HelperSlot, plan.Summary, "released");
+                    SyncCarriedFromHauler(hauler, session, "after-helper-release");
+                    ClearDropPhaseIfEmpty(hauler, session);
+                    return;
+                }
+
                 if (session.Mode == BigHaulPaintMode.Drag)
                 {
                     BigHaulRegistry.MarkState(plan.Item, "Done", "BIG drag drop complete");
@@ -2796,22 +3800,94 @@ namespace OstranautsHaulingV2
             }
 
             RemoveSame(session.Carried, item);
-            BigHaulRegistry.MarkState(item, "Done", "BIG drop complete");
-            Plugin.ModInfo("[BIGDropDone] hauler=" + Plugin.SafeName(hauler) + " item=" + Plugin.Describe(item) + " target=" + plan.Summary + " pending=" + session.Pending.Count + " carried=" + session.Carried.Count + ".");
+            if (plan.HelperRelease)
+            {
+                MarkSessionHelperReleased(session, item, plan.HelperSlot, plan.Summary, "released");
+            }
+            else
+            {
+                BigHaulRegistry.MarkState(item, "Done", "BIG drop complete");
+                Plugin.ModInfo("[BIGDropDone] hauler=" + Plugin.SafeName(hauler) + " item=" + Plugin.Describe(item) + " target=" + plan.Summary + " pending=" + session.Pending.Count + " carried=" + session.Carried.Count + ".");
+            }
 
             SyncCarriedFromHauler(hauler, session, "after-drop");
-
-            if (session.Carried.Count == 0)
-            {
-                session.DropPhase = false;
-                session.DropAnchorShip = null;
-                session.DropAnchorZone = null;
-                session.DropAnchorPosition = Vector3.zero;
-                Plugin.ModInfo("[BIGDropPhase] hauler=" + Plugin.SafeName(hauler) + " state=finished pending=" + session.Pending.Count + ".");
-            }
+            ClearDropPhaseIfEmpty(hauler, session);
         }
 
-        private static bool TryFindDropPlan(CondOwner hauler, CondOwner item, out DropPlan best)
+        private static List<SessionHelperCandidate> FindSessionOwnedHelpers(CondOwner hauler, BigLooseHaulSession session)
+        {
+            var helpers = new List<SessionHelperCandidate>();
+            var seen = new HashSet<string>();
+
+            if (hauler == null || session == null || session.SessionOwnedHelperIds.Count == 0)
+                return helpers;
+
+            Action<CondOwner> addIfOwned = helper =>
+            {
+                var id = SafeId(helper);
+                if (string.IsNullOrEmpty(id) || !seen.Add(id))
+                    return;
+
+                if (!session.SessionOwnedHelperIds.Contains(id) || session.PreExistingHelperIds.Contains(id))
+                    return;
+
+                var slot = Plugin.GetSessionHelperSlot(helper);
+                if (slot == BigHaulHelperSlot.None)
+                    return;
+
+                helpers.Add(new SessionHelperCandidate
+                {
+                    Item = helper,
+                    Slot = slot,
+                    Score = slot == BigHaulHelperSlot.Hand ? 0f : 1f
+                });
+            };
+
+            try
+            {
+                foreach (var helper in Plugin.GetHaulHelpersForHauler(hauler))
+                    addIfOwned(helper);
+
+                addIfOwned(GetDragSlotItem(hauler));
+            }
+            catch (Exception ex)
+            {
+                Plugin.Warn("[BIGHelperRelease] helper scan failed: hauler=" + Plugin.SafeName(hauler) + " error=" + ex.Message);
+            }
+
+            return helpers.OrderBy(helper => helper.Score).ToList();
+        }
+
+        private static void MarkSessionHelperReleased(BigLooseHaulSession session, CondOwner helper, BigHaulHelperSlot slot, string target, string result)
+        {
+            var id = SafeId(helper);
+            if (!string.IsNullOrEmpty(id))
+                session.SessionOwnedHelperIds.Remove(id);
+
+            if (helper != null)
+                BigHaulRegistry.MarkState(helper, "Done", "BIG helper " + result);
+
+            Plugin.ModInfo("[BIGHelperReleased] hauler=" + session.HaulerName
+                + " helper=" + Plugin.Describe(helper)
+                + " slot=" + slot
+                + " result=" + result
+                + " target=" + target
+                + " remainingOwnedHelpers=" + session.SessionOwnedHelperIds.Count + ".");
+        }
+
+        private static void ClearDropPhaseIfEmpty(CondOwner hauler, BigLooseHaulSession session)
+        {
+            if (session == null || session.Carried.Count != 0)
+                return;
+
+            session.DropPhase = false;
+            session.DropAnchorShip = null;
+            session.DropAnchorZone = null;
+            session.DropAnchorPosition = Vector3.zero;
+            Plugin.ModInfo("[BIGDropPhase] hauler=" + Plugin.SafeName(hauler) + " state=finished pending=" + session.Pending.Count + ".");
+        }
+
+        private static bool TryFindDropPlan(CondOwner hauler, CondOwner item, out DropPlan best, bool allowAnyStockpileZone = false)
         {
             best = null;
 
@@ -2837,8 +3913,12 @@ namespace OstranautsHaulingV2
                     if (zone.strRegID == null || CrewSim.system == null || CrewSim.system.dictShips == null || !CrewSim.system.dictShips.TryGetValue(zone.strRegID, out zoneShip))
                         continue;
 
-                    if (!MatchesZoneCategory(item, zone))
+                    var categoryMatch = MatchesZoneCategory(item, zone);
+                    if (!categoryMatch && !allowAnyStockpileZone)
                         continue;
+
+                    var zonePenalty = categoryMatch ? 0 : AnyStockpileZonePenalty;
+                    var summaryPrefix = categoryMatch ? "" : "any-zone-";
 
                     if (validDest != null)
                     {
@@ -2861,8 +3941,8 @@ namespace OstranautsHaulingV2
                                 StackTarget = existing,
                                 WalkTarget = existing,
                                 DropPosition = existing.tf.position,
-                                Score = ScoreDrop(hauler, existing.tf.position, 0),
-                                Summary = "stack ship=" + zoneShip.strRegID + " zone=" + zone.strName + " target=" + Plugin.SafeName(existing)
+                                Score = ScoreDrop(hauler, existing.tf.position, zonePenalty),
+                                Summary = summaryPrefix + "stack ship=" + zoneShip.strRegID + " zone=" + zone.strName + " target=" + Plugin.SafeName(existing)
                             });
                         }
                     }
@@ -2874,6 +3954,15 @@ namespace OstranautsHaulingV2
                     var emptyCandidates = BuildEmptyDropPlans(hauler, item, itemComponent, zoneShip, zone);
                     if (emptyCandidates.Count > 0)
                     {
+                        if (!categoryMatch)
+                        {
+                            foreach (var candidate in emptyCandidates)
+                            {
+                                candidate.Score += zonePenalty;
+                                candidate.Summary = summaryPrefix + candidate.Summary;
+                            }
+                        }
+
                         candidates.AddRange(emptyCandidates);
                         continue;
                     }
@@ -2884,12 +3973,12 @@ namespace OstranautsHaulingV2
                         var tile = zoneShip.GetTileAtWorldCoords1(fits.x, fits.y, true);
                         if (tile != null && tile.coProps != null)
                         {
-                            var score = ScoreDrop(hauler, fits, 1000);
+                            var score = ScoreDrop(hauler, fits, 1000 + zonePenalty);
                             if (hauler != null)
                             {
                                 BigLooseHaulSession session;
                                 if (ActiveSessions.TryGetValue(SafeId(hauler), out session) && session.DropPhase && session.DropAnchorShip == zoneShip && session.DropAnchorZone == zone)
-                                    score = ScoreDropAnchor(session, fits);
+                                    score = ScoreDropAnchor(session, fits) + zonePenalty;
                             }
 
                             candidates.Add(new DropPlan
@@ -2899,7 +3988,7 @@ namespace OstranautsHaulingV2
                                 WalkTarget = tile.coProps,
                                 DropPosition = new Vector3(fits.x, fits.y, item.tf.position.z),
                                 Score = score,
-                                Summary = "empty-fallback ship=" + zoneShip.strRegID + " zone=" + zone.strName + " tile=" + tile.Index
+                                Summary = summaryPrefix + "empty-fallback ship=" + zoneShip.strRegID + " zone=" + zone.strName + " tile=" + tile.Index
                             });
                         }
                     }
@@ -2946,15 +4035,28 @@ namespace OstranautsHaulingV2
                     if (!CanItemFitAt(itemComponent, zoneShip, zone, pos))
                         continue;
 
-                    plans.Add(new DropPlan
+                    AddEmptyDropPlan(plans, hauler, zoneShip, zone, tile.coProps, tile.Index, pos, anchor, "empty-spiral");
+                }
+
+                if (plans.Count == 0)
+                {
+                    foreach (var tileIndex in zone.aTiles)
                     {
-                        TargetShip = zoneShip,
-                        Zone = zone,
-                        WalkTarget = tile.coProps,
-                        DropPosition = pos,
-                        Score = ScoreDropSpiral(hauler, anchor, pos, 1000),
-                        Summary = "empty-spiral ship=" + zoneShip.strRegID + " zone=" + zone.strName + " tile=" + tile.Index
-                    });
+                        var coords = zoneShip.GetWorldCoordsAtTileIndex1(tileIndex);
+                        var z = item.tf != null ? item.tf.position.z : 0f;
+
+                        foreach (var pos in BuildOffsetDropPositions(coords.x, coords.y, z))
+                        {
+                            var tile = zoneShip.GetTileAtWorldCoords1(pos.x, pos.y, true);
+                            if (tile == null || tile.coProps == null)
+                                continue;
+
+                            if (!CanItemFitAt(itemComponent, zoneShip, zone, pos))
+                                continue;
+
+                            AddEmptyDropPlan(plans, hauler, zoneShip, zone, tile.coProps, tile.Index, pos, anchor, "empty-offset");
+                        }
+                    }
                 }
             }
             catch (Exception ex)
@@ -2963,6 +4065,34 @@ namespace OstranautsHaulingV2
             }
 
             return plans;
+        }
+
+        private static IEnumerable<Vector3> BuildOffsetDropPositions(float x, float y, float z)
+        {
+            yield return new Vector3(x + 0.5f, y, z);
+            yield return new Vector3(x - 0.5f, y, z);
+            yield return new Vector3(x, y + 0.5f, z);
+            yield return new Vector3(x, y - 0.5f, z);
+            yield return new Vector3(x + 0.5f, y + 0.5f, z);
+            yield return new Vector3(x - 0.5f, y + 0.5f, z);
+            yield return new Vector3(x + 0.5f, y - 0.5f, z);
+            yield return new Vector3(x - 0.5f, y - 0.5f, z);
+        }
+
+        private static void AddEmptyDropPlan(List<DropPlan> plans, CondOwner hauler, Ship zoneShip, JsonZone zone, CondOwner walkTarget, int tileIndex, Vector3 pos, Vector3 anchor, string mode)
+        {
+            if (plans == null || zoneShip == null || zone == null || walkTarget == null)
+                return;
+
+            plans.Add(new DropPlan
+            {
+                TargetShip = zoneShip,
+                Zone = zone,
+                WalkTarget = walkTarget,
+                DropPosition = pos,
+                Score = ScoreDropSpiral(hauler, anchor, pos, 1000),
+                Summary = mode + " ship=" + zoneShip.strRegID + " zone=" + zone.strName + " tile=" + tileIndex
+            });
         }
 
         private static bool CanItemFitAt(Item itemComponent, Ship zoneShip, JsonZone zone, Vector3 pos)
@@ -3402,12 +4532,14 @@ namespace OstranautsHaulingV2
         {
             session.Pending = session.Pending
                 .Where(item => IsRetainablePendingItem(hauler, item, session))
+                .Where(item => !IsDropFailed(session, item))
                 .GroupBy(SafeId)
                 .Select(group => group.First())
                 .ToList();
 
             session.Backlog = session.Backlog
                 .Where(item => IsRetainablePendingItem(hauler, item, session))
+                .Where(item => !IsDropFailed(session, item))
                 .GroupBy(SafeId)
                 .Select(group => group.First())
                 .ToList();
@@ -3416,6 +4548,8 @@ namespace OstranautsHaulingV2
                 .Where(item => item != null && !item.bDestroyed)
                 .Select(StackHead)
                 .Where(item => item != null)
+                .Where(item => !IsDropFailed(session, item))
+                .Where(item => session.Mode != BigHaulPaintMode.Haul || Plugin.GetSessionHelperSlot(item) == BigHaulHelperSlot.None)
                 .GroupBy(SafeId)
                 .Select(group => group.First())
                 .ToList();
@@ -3447,6 +4581,14 @@ namespace OstranautsHaulingV2
         {
             try
             {
+                if (mode == BigHaulPaintMode.Haul)
+                {
+                    BigHaulHelperSlot helperSlot;
+                    string helperReason;
+                    if (Plugin.IsSessionHelperCandidate(item, out helperSlot, out helperReason))
+                        return false;
+                }
+
                 string reason;
                 return Plugin.IsCandidateForMode(hauler, item, mode, out reason);
             }
@@ -3481,11 +4623,17 @@ namespace OstranautsHaulingV2
             if (session.CurrentPickup != null && IsValidPendingItem(hauler, session.CurrentPickup, session.Mode))
                 BigHaulRegistry.MarkState(session.CurrentPickup, "Cancelled", reason);
 
+            if (session.CurrentHelperAcquire != null)
+                BigHaulRegistry.MarkState(session.CurrentHelperAcquire, "Cancelled", reason);
+
             foreach (var item in session.Pending.ToList())
                 BigHaulRegistry.MarkState(item, "Cancelled", reason);
 
             foreach (var item in session.Backlog.ToList())
                 BigHaulRegistry.MarkState(item, "Cancelled", reason);
+
+            foreach (var helper in session.HandHelperCandidates.Concat(session.DragHelperCandidates).ToList())
+                BigHaulRegistry.MarkState(helper, "Cancelled", reason);
 
             if (clearQueue)
                 SafeClearQueue(hauler, "cancel BIG session: " + reason);
@@ -3496,6 +4644,7 @@ namespace OstranautsHaulingV2
                 + " backlog=" + session.Backlog.Count
                 + " carried=" + session.Carried.Count
                 + " currentPickup=" + Plugin.Describe(session.CurrentPickup)
+                + " currentHelper=" + Plugin.Describe(session.CurrentHelperAcquire)
                 + " currentDrop=" + (session.CurrentDrop != null ? session.CurrentDrop.Summary : "<none>")
                 + ".");
             return true;
@@ -3529,6 +4678,33 @@ namespace OstranautsHaulingV2
                 else if (IsValidPendingItem(hauler, pickup, session.Mode) && !ContainsSame(session.Pending, pickup))
                 {
                     session.Pending.Insert(0, pickup);
+                }
+            }
+
+            if (session.CurrentHelperAcquire != null)
+            {
+                var helper = session.CurrentHelperAcquire;
+                var helperSlot = session.CurrentHelperSlot;
+                session.CurrentHelperAcquire = null;
+                session.CurrentHelperSlot = BigHaulHelperSlot.None;
+
+                var dragged = helperSlot == BigHaulHelperSlot.Drag ? GetDragSlotItem(hauler) : null;
+                if (IsOwnedByHauler(hauler, helper) || SameItem(dragged, helper))
+                {
+                    var ownedHelper = SameItem(dragged, helper) ? dragged : ResolveOwnedCarried(hauler, helper);
+                    var id = SafeId(ownedHelper ?? helper);
+                    if (!string.IsNullOrEmpty(id))
+                        session.SessionOwnedHelperIds.Add(id);
+
+                    BigHaulRegistry.MarkState(ownedHelper ?? helper, "HelperAcquired", "BIG helper completed before pause");
+                }
+                else if (helperSlot == BigHaulHelperSlot.Hand && !ContainsSame(session.HandHelperCandidates, helper))
+                {
+                    session.HandHelperCandidates.Insert(0, helper);
+                }
+                else if (helperSlot == BigHaulHelperSlot.Drag && !ContainsSame(session.DragHelperCandidates, helper))
+                {
+                    session.DragHelperCandidates.Insert(0, helper);
                 }
             }
 
@@ -3644,6 +4820,9 @@ namespace OstranautsHaulingV2
                 if (head != null && !head.bDestroyed && IsOwnedByHauler(hauler, head))
                     return head;
 
+                if (RequiresExactCarriedResolution(head ?? item))
+                    return null;
+
                 var itemKey = InventoryCargoKey(item);
                 if (string.IsNullOrEmpty(itemKey) || hauler == null)
                     return null;
@@ -3666,6 +4845,12 @@ namespace OstranautsHaulingV2
             return null;
         }
 
+        private static bool RequiresExactCarriedResolution(CondOwner item)
+        {
+            return Plugin.GetSessionHelperSlot(item) != BigHaulHelperSlot.None
+                || HasCond(item, "IsContainer");
+        }
+
         private static void SyncCarriedFromHauler(CondOwner hauler, BigLooseHaulSession session, string reason)
         {
             try
@@ -3678,6 +4863,7 @@ namespace OstranautsHaulingV2
                     .Where(item => item != null)
                     .Select(StackHead)
                     .Where(item => item != null && !item.bDestroyed)
+                    .Where(item => !IsDropFailed(session, item))
                     .ToList();
 
                 foreach (var candidate in hauler.GetCOsSafe(true))
@@ -3686,7 +4872,13 @@ namespace OstranautsHaulingV2
                     if (head == null || head.bDestroyed)
                         continue;
 
+                    if (IsDropFailed(session, head))
+                        continue;
+
                     if (!IsOwnedByHauler(hauler, head))
+                        continue;
+
+                    if (session.Mode == BigHaulPaintMode.Haul && Plugin.GetSessionHelperSlot(head) != BigHaulHelperSlot.None)
                         continue;
 
                     if (!BigHaulRegistry.IsTracked(head))
@@ -3703,8 +4895,14 @@ namespace OstranautsHaulingV2
                 {
                     var dragged = GetDragSlotItem(hauler);
                     var draggedHead = StackHead(dragged);
-                    if (draggedHead != null && !draggedHead.bDestroyed && !ContainsSame(synced, draggedHead))
+                    if (draggedHead != null
+                        && !draggedHead.bDestroyed
+                        && Plugin.GetSessionHelperSlot(draggedHead) == BigHaulHelperSlot.None
+                        && !IsDropFailed(session, draggedHead)
+                        && !ContainsSame(synced, draggedHead))
+                    {
                         synced.Add(draggedHead);
+                    }
                 }
 
                 session.Carried = synced
@@ -3733,14 +4931,21 @@ namespace OstranautsHaulingV2
 
                 var scanned = 0;
                 var added = 0;
+                var helperSummaries = new List<string>();
                 foreach (var helper in helpers)
                 {
+                    var helperAdded = 0;
+                    var helperScanned = 0;
                     foreach (var cargo in Plugin.GetDirectHaulHelperCargo(helper))
                     {
                         scanned++;
+                        helperScanned++;
 
                         var head = StackHead(cargo);
                         if (head == null || head.bDestroyed)
+                            continue;
+
+                        if (IsDropFailed(session, head))
                             continue;
 
                         if (!IsOwnedByHauler(hauler, head))
@@ -3752,7 +4957,13 @@ namespace OstranautsHaulingV2
                         TrackSessionCargoKey(session, head);
                         carried.Add(head);
                         added++;
+                        helperAdded++;
                     }
+
+                    helperSummaries.Add(Plugin.SafeName(helper)
+                        + " slot=" + Plugin.GetActiveHaulHelperSlotName(hauler, helper)
+                        + " scanned=" + helperScanned
+                        + " added=" + helperAdded);
                 }
 
                 if (added > 0)
@@ -3762,6 +4973,7 @@ namespace OstranautsHaulingV2
                         + " helpers=" + helpers.Count
                         + " scanned=" + scanned
                         + " added=" + added
+                        + " activeHelpers=[" + string.Join("; ", helperSummaries.ToArray()) + "]"
                         + " carried=" + carried.Count + ".");
                 }
             }
@@ -3792,7 +5004,16 @@ namespace OstranautsHaulingV2
 
         private static bool CanAddDirectCarried(BigLooseHaulSession session, CondOwner item, string reason)
         {
-            if (session == null || item == null || session.Mode != BigHaulPaintMode.Haul)
+            if (session == null || item == null)
+                return true;
+
+            if (IsDropFailed(session, item))
+                return false;
+
+            if (session.Mode == BigHaulPaintMode.Drag && Plugin.GetSessionHelperSlot(item) != BigHaulHelperSlot.None)
+                return false;
+
+            if (session.Mode != BigHaulPaintMode.Haul)
                 return true;
 
             var id = SafeId(item);
@@ -3872,6 +5093,9 @@ namespace OstranautsHaulingV2
                 {
                     var head = StackHead(item);
                     if (head == null || head.bDestroyed || ContainsSame(carried, head))
+                        continue;
+
+                    if (IsDropFailed(session, head))
                         continue;
 
                     var key = InventoryCargoKey(head);
@@ -4242,6 +5466,13 @@ namespace OstranautsHaulingV2
             return !string.IsNullOrEmpty(id) && list.Any(existing => SafeId(existing) == id);
         }
 
+        private static bool SameItem(CondOwner left, CondOwner right)
+        {
+            var leftId = SafeId(left);
+            var rightId = SafeId(right);
+            return !string.IsNullOrEmpty(leftId) && leftId == rightId;
+        }
+
         private static void RemoveSame(List<CondOwner> list, CondOwner item)
         {
             var id = SafeId(item);
@@ -4293,7 +5524,11 @@ namespace OstranautsHaulingV2
         internal List<CondOwner> Pending = new List<CondOwner>();
         internal List<CondOwner> Backlog = new List<CondOwner>();
         internal List<CondOwner> Carried = new List<CondOwner>();
+        internal List<CondOwner> HandHelperCandidates = new List<CondOwner>();
+        internal List<CondOwner> DragHelperCandidates = new List<CondOwner>();
         internal CondOwner CurrentPickup;
+        internal CondOwner CurrentHelperAcquire;
+        internal BigHaulHelperSlot CurrentHelperSlot = BigHaulHelperSlot.None;
         internal DropPlan CurrentDrop;
         internal DateTime StartedAt;
         internal bool AutoPausedLogged;
@@ -4307,6 +5542,13 @@ namespace OstranautsHaulingV2
         internal HashSet<string> BaselineInventoryIds = new HashSet<string>(StringComparer.Ordinal);
         internal HashSet<string> SessionCargoKeys = new HashSet<string>(StringComparer.Ordinal);
         internal HashSet<string> BaselineMergeWarnings = new HashSet<string>(StringComparer.Ordinal);
+        internal bool PreExistingHelpersCaptured;
+        internal HashSet<string> PreExistingHelperIds = new HashSet<string>(StringComparer.Ordinal);
+        internal HashSet<string> SessionOwnedHelperIds = new HashSet<string>(StringComparer.Ordinal);
+        internal HashSet<string> HelperAcquireFailedIds = new HashSet<string>(StringComparer.Ordinal);
+        internal HashSet<string> FailedDropIds = new HashSet<string>(StringComparer.Ordinal);
+        internal Dictionary<string, int> DropSearchAttempts = new Dictionary<string, int>(StringComparer.Ordinal);
+        internal Dictionary<string, DateTime> NextDropSearchAtUtc = new Dictionary<string, DateTime>(StringComparer.Ordinal);
     }
 
     internal sealed class DropPlan
@@ -4319,6 +5561,15 @@ namespace OstranautsHaulingV2
         internal Vector3 DropPosition;
         internal int Score;
         internal string Summary;
+        internal bool HelperRelease;
+        internal BigHaulHelperSlot HelperSlot = BigHaulHelperSlot.None;
+    }
+
+    internal sealed class SessionHelperCandidate
+    {
+        internal CondOwner Item;
+        internal BigHaulHelperSlot Slot;
+        internal float Score;
     }
 
     internal static class BigHaulRegistry
