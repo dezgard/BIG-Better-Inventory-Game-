@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.9.0
+
+- Replaced the old vanilla-haul compactor with the new BIG-owned hauling rewrite.
+- Added BIG-owned haul and drag selection modes.
+- Added BIG-owned item markers and cursor feedback for active BIG mode.
+- Improved large-area selection handling for high-object-count cleanup jobs.
+- Reduced vanilla task churn when selecting large areas or whole ships for hauling.
+- Added smarter pickup ordering and stockpile-aware drop planning.
+- Added safeguards so BIG mode switches, vanilla haul selection, and cancel actions do not leave overlapping plans behind.
+- Added session logs under `BepInEx\BIGSupportLogs`.
+- Install note: remove old `BIGLooseHaulPrototype.dll` test builds before installing this release.
+
 ## 0.8.17
 
 - Deferred blocked primary haul jobs when other loose items can still fit.
@@ -112,7 +124,7 @@
 - Removed LaunchControl dependency usage; this version only requires BepInEx.
 - Kept the safer item filter changes for smart batching.
 - Bottles/flasks are no longer treated as bulky by name alone, so normal inventory bottles can batch when the game says they fit.
-- Containers are no longer blanket-skipped by condition alone; true drag/bulky items are still left to vanilla.
+- Containers are no longer blanket-skipped by condition alone; true drag/bulky items are still left for vanilla.
 - Items with non-hand equipment slots are skipped by smart batching to avoid pulling equipped/slot-style items into mass haul batches.
 
 ## 0.6.0
@@ -159,6 +171,4 @@
 
 ## 0.1.0
 
-- Fresh restart of the hauling mod.
-- Removed the custom selection takeover approach.
-- Added a simple first-pass batcher for marked loose items.
+- Initial experimental hauling prototype.

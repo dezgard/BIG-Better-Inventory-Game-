@@ -1,1705 +1,1805 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.IO.Compression;
 using System.Linq;
-using System.Reflection;
-using System.Text;
 using BepInEx;
-using BepInEx.Bootstrap;
 using BepInEx.Logging;
 using HarmonyLib;
-using Ostranauts.Inventory;
+using Ostranauts.UI.PDA;
+using UnityEngine;
 
 namespace OstranautsHaulingV2
 {
-    internal static class BigSupportLog
+    internal enum BigHaulPaintMode
     {
-        private const int PreviousSessionLogsToKeep = 2;
-        private static readonly object Sync = new object();
-        private static string _logDir;
-        private static string _sessionLogPath;
-        private static bool _initialized;
-
-        internal static string ZipPath { get; private set; }
-
-        internal static void Init(string pluginVersion)
-        {
-            lock (Sync)
-            {
-                if (_initialized)
-                    return;
-
-                _initialized = true;
-                _logDir = Path.Combine(GetBepInExRoot(), "BIGSupportLogs");
-                Directory.CreateDirectory(_logDir);
-                ZipPreviousLooseLogs();
-                PurgeOldSupportLogs();
-
-                var stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
-                _sessionLogPath = Path.Combine(_logDir, "BIG-" + stamp + ".log");
-                ZipPath = Path.Combine(_logDir, "BIG-" + stamp + ".zip");
-
-                WriteRaw("=== BIG support log started " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " ===");
-                WriteRaw("Plugin version: " + pluginVersion);
-                WriteRaw("BepInEx root: " + GetBepInExRoot());
-                WriteRaw("Game root: " + SafePath(() => Paths.GameRootPath));
-                WriteRaw("Plugin path: " + Assembly.GetExecutingAssembly().Location);
-                WriteRaw("");
-                WritePluginSnapshot();
-                WriteRaw("");
-            }
-        }
-
-        internal static void ModInfo(string message)
-        {
-            Write("INFO", message);
-        }
-
-        internal static void ModWarn(string message)
-        {
-            Write("WARN", message);
-        }
-
-        internal static void ModError(string message)
-        {
-            Write("ERROR", message);
-        }
-
-        internal static void Shutdown()
-        {
-            lock (Sync)
-            {
-                if (!_initialized || string.IsNullOrEmpty(_sessionLogPath))
-                    return;
-
-                WriteRaw("");
-                WriteRaw("=== BIG support log ended " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " ===");
-                TryZipFile(_sessionLogPath, ZipPath);
-            }
-        }
-
-        private static void Write(string level, string message)
-        {
-            lock (Sync)
-            {
-                if (!_initialized || string.IsNullOrEmpty(_sessionLogPath))
-                    return;
-
-                WriteRaw(DateTime.Now.ToString("HH:mm:ss.fff") + " [" + level + "] " + (message ?? ""));
-            }
-        }
-
-        private static void WriteRaw(string line)
-        {
-            try
-            {
-                File.AppendAllText(_sessionLogPath, line + Environment.NewLine);
-            }
-            catch
-            {
-                // Support logging must never affect hauling behavior.
-            }
-        }
-
-        private static void ZipPreviousLooseLogs()
-        {
-            try
-            {
-                foreach (var logPath in Directory.GetFiles(_logDir, "BIG-*.log"))
-                {
-                    var zipPath = Path.ChangeExtension(logPath, ".zip");
-                    if (File.Exists(zipPath))
-                        continue;
-
-                    TryZipFile(logPath, zipPath);
-                }
-            }
-            catch
-            {
-                // Best effort only.
-            }
-        }
-
-        private static void PurgeOldSupportLogs()
-        {
-            try
-            {
-                var files = Directory.GetFiles(_logDir, "BIG-*.*")
-                    .Select(path => new FileInfo(path))
-                    .Where(info => string.Equals(info.Extension, ".zip", StringComparison.OrdinalIgnoreCase)
-                        || string.Equals(info.Extension, ".log", StringComparison.OrdinalIgnoreCase))
-                    .OrderByDescending(info => info.LastWriteTimeUtc)
-                    .ToList();
-
-                var kept = 0;
-                foreach (var file in files)
-                {
-                    if (kept < PreviousSessionLogsToKeep)
-                    {
-                        kept++;
-                        continue;
-                    }
-
-                    try
-                    {
-                        file.Delete();
-                    }
-                    catch
-                    {
-                    }
-                }
-            }
-            catch
-            {
-                // Best effort only. Log cleanup must never block startup.
-            }
-        }
-
-        private static void WritePluginSnapshot()
-        {
-            WriteRaw("=== Installed/loaded plugin snapshot ===");
-
-            try
-            {
-                var infos = Chainloader.PluginInfos;
-                WriteRaw("Loaded BepInEx plugins: " + (infos?.Count ?? 0));
-                if (infos != null)
-                {
-                    foreach (var entry in infos.OrderBy(e => e.Key, StringComparer.OrdinalIgnoreCase))
-                    {
-                        var info = entry.Value;
-                        var metadata = info?.Metadata;
-                        WriteRaw("- " + (metadata?.GUID ?? entry.Key ?? "<unknown>")
-                            + " | " + (metadata?.Name ?? "<unknown>")
-                            + " | " + (metadata?.Version?.ToString() ?? "<unknown>")
-                            + " | " + (info?.Location ?? "<unknown>"));
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                WriteRaw("Loaded BepInEx plugins: failed to read: " + ex.GetType().Name + ": " + ex.Message);
-            }
-
-            try
-            {
-                var errors = Chainloader.DependencyErrors;
-                WriteRaw("BepInEx dependency errors: " + (errors?.Count ?? 0));
-                if (errors != null)
-                {
-                    foreach (var error in errors)
-                        WriteRaw("- " + error);
-                }
-            }
-            catch (Exception ex)
-            {
-                WriteRaw("BepInEx dependency errors: failed to read: " + ex.GetType().Name + ": " + ex.Message);
-            }
-
-            try
-            {
-                var pluginPath = Paths.PluginPath;
-                WriteRaw("Plugin folder files: " + pluginPath);
-                if (Directory.Exists(pluginPath))
-                {
-                    foreach (var file in Directory.GetFiles(pluginPath).OrderBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase))
-                    {
-                        var info = new FileInfo(file);
-                        WriteRaw("- " + info.Name
-                            + " | " + info.Length + " bytes"
-                            + " | modified " + info.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")
-                            + " | " + PluginFileState(info));
-                    }
-                }
-                else
-                {
-                    WriteRaw("- plugin folder not found");
-                }
-            }
-            catch (Exception ex)
-            {
-                WriteRaw("Plugin folder files: failed to read: " + ex.GetType().Name + ": " + ex.Message);
-            }
-        }
-
-        private static string PluginFileState(FileInfo info)
-        {
-            if (info == null)
-                return "unknown";
-
-            if (string.Equals(info.Extension, ".dll", StringComparison.OrdinalIgnoreCase))
-                return "dll-load-candidate";
-
-            if (info.Name.IndexOf(".dll.", StringComparison.OrdinalIgnoreCase) >= 0
-                || info.Name.EndsWith(".dll.txt", StringComparison.OrdinalIgnoreCase))
-                return "disabled-or-renamed-dll";
-
-            return "non-dll-file";
-        }
-
-        private static void TryZipFile(string logPath, string zipPath)
-        {
-            try
-            {
-                if (string.IsNullOrEmpty(logPath) || !File.Exists(logPath))
-                    return;
-
-                zipPath = GetAvailableZipPath(zipPath);
-                using (var zipStream = new FileStream(zipPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None))
-                using (var archive = new ZipArchive(zipStream, ZipArchiveMode.Create))
-                {
-                    var entry = archive.CreateEntry(Path.GetFileName(logPath), CompressionLevel.Optimal);
-                    using (var entryStream = entry.Open())
-                    using (var logStream = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-                    {
-                        logStream.CopyTo(entryStream);
-                    }
-                }
-            }
-            catch
-            {
-                // Leave the loose log in place if zipping fails.
-            }
-        }
-
-        private static string GetAvailableZipPath(string requestedPath)
-        {
-            if (!File.Exists(requestedPath))
-                return requestedPath;
-
-            var folder = Path.GetDirectoryName(requestedPath);
-            var name = Path.GetFileNameWithoutExtension(requestedPath);
-            var ext = Path.GetExtension(requestedPath);
-
-            for (var i = 2; i < 1000; i++)
-            {
-                var candidate = Path.Combine(folder, name + "-" + i + ext);
-                if (!File.Exists(candidate))
-                    return candidate;
-            }
-
-            return Path.Combine(folder, name + "-" + DateTime.Now.Ticks + ext);
-        }
-
-        private static string GetBepInExRoot()
-        {
-            try
-            {
-                if (!string.IsNullOrEmpty(Paths.BepInExRootPath))
-                    return Paths.BepInExRootPath;
-            }
-            catch
-            {
-            }
-
-            var pluginPath = Assembly.GetExecutingAssembly().Location;
-            return Path.GetDirectoryName(Path.GetDirectoryName(pluginPath)) ?? Path.GetDirectoryName(pluginPath) ?? ".";
-        }
-
-        private static string SafePath(Func<string> getter)
-        {
-            try
-            {
-                return getter() ?? "";
-            }
-            catch
-            {
-                return "";
-            }
-        }
+        None,
+        Haul,
+        Drag
     }
 
-    [BepInPlugin("com.dezgard.ostranauts.haulingv2", "Ostranauts Hauling V2", "0.8.17")]
+    [BepInPlugin(PluginGuid, PluginName, PluginVersion)]
     public sealed class Plugin : BaseUnityPlugin
     {
-        internal const string PluginVersion = "0.8.17";
+        internal const string PluginGuid = "com.dezgard.ostranauts.haulingv2";
+        internal const string PluginName = "BIG Better Inventory Game";
+        internal const string PluginVersion = "0.9.0";
+        internal const string BigHaulInteraction = "BIGHaulItems";
+        internal const string BigHaulMarkerIcon = "BIGIcoHaulMarked";
+        private const string LooseButtonIcon = "BIGGUIHaulCart";
+        private const string DragButtonIcon = "BIGGUIHaulDrag";
+        private const string LooseButtonObjectName = "BIGLooseHaulPrototype_BIG_HAUL";
+        private const string LegacyCartButtonObjectName = "BIGLooseHaulPrototype_BIG_CART";
+        private const string DragButtonObjectName = "BIGLooseHaulPrototype_BIG_DRAG";
+
+        private static Harmony _harmony;
+        private static bool _interactionInstalled;
+        private static bool _assetPathRegistered;
+        private static BigHaulPaintMode _bigHaulPaintMode = BigHaulPaintMode.None;
+        private static bool _bigSelectionDragging;
+        private static Vector2 _bigSelectionStart;
+        private static Vector2 _bigSelectionEnd;
+        private static bool _bigSelectionWorldReady;
+        private static Vector3 _bigSelectionWorldStart;
+        private static Vector3 _bigSelectionWorldEnd;
+        private static Texture2D _cursorTexture;
+        private static BigHaulPaintMode _cursorTextureMode = BigHaulPaintMode.None;
+        private static float _lastCancelBoundsScanTime = -100f;
+        private static string _lastCancelBoundsScanKey = "";
+        private float _nextLiveScanTime;
+        private float _nextIconRefreshTime;
+
         internal static ManualLogSource Log { get; private set; }
-        private Harmony _harmony;
 
         private void Awake()
         {
             Log = Logger;
-            BigSupportLog.Init(PluginVersion);
-            _harmony = new Harmony("com.dezgard.ostranauts.haulingv2");
+            BigLog.Init(PluginVersion);
+
+            _harmony = new Harmony(PluginGuid);
             _harmony.PatchAll();
-            ModInfo("Ostranauts Hauling V2 " + PluginVersion + " loaded. Smart drop-zone planning prefers good stacks and helper containers require loose haul items. Support zip will be written to " + BigSupportLog.ZipPath);
+
+            ModInfo(PluginName + " " + PluginVersion + " loaded.");
+        }
+
+        private void Update()
+        {
+            if (!_interactionInstalled && IsDataReady())
+                InstallCustomInteraction();
+
+            if (_interactionInstalled && Time.realtimeSinceStartup >= _nextIconRefreshTime)
+            {
+                _nextIconRefreshTime = Time.realtimeSinceStartup + 0.5f;
+                BigHaulRegistry.RefreshOwnedIcons();
+                BigHaulPlanner.PumpSelectedCrew();
+            }
+
+            if (_interactionInstalled && BigHaulPaintActive)
+                HandleBigSelectionInput();
+
+            if (!_interactionInstalled || Time.realtimeSinceStartup < _nextLiveScanTime)
+                return;
+
+            _nextLiveScanTime = Time.realtimeSinceStartup + 5f;
+            var added = AddInteractionToLoadedObjects();
+            if (added > 0)
+                ModInfo("Added BIG Haul Items to " + added + " loaded loose-item candidates.");
+        }
+
+        private void OnGUI()
+        {
+            DrawBigSelectionBox();
         }
 
         private void OnDestroy()
         {
             try
             {
-                ModInfo("Ostranauts Hauling V2 " + PluginVersion + " unloading.");
                 _harmony?.UnpatchSelf();
             }
-            finally
+            catch
             {
-                BigSupportLog.Shutdown();
+                // Shutdown must not throw during game exit.
             }
+
+            BigLog.Close();
         }
 
-        internal static void ModInfo(string message)
+        internal static void InstallCustomInteraction()
         {
-            Log?.LogInfo(message);
-            BigSupportLog.ModInfo(message);
-        }
-
-        internal static void ModWarn(string message)
-        {
-            Log?.LogWarning(message);
-            BigSupportLog.ModWarn(message);
-        }
-
-        internal static void ModError(string message)
-        {
-            Log?.LogError(message);
-            BigSupportLog.ModError(message);
-        }
-    }
-
-    internal static class VanillaHaulBatcher
-    {
-        private const int HardSafetyLimit = 200;
-        private static readonly HashSet<string> CompactingHaulerIDs = new HashSet<string>();
-        private static readonly System.Reflection.MethodInfo GetPathToWalkableOriginMethod = AccessTools.Method(typeof(Pathfinder), "GetPathToWalkableOrigin", new[] { typeof(Tile), typeof(Tile) });
-
-        internal static void TryCompact(CondOwner hauler)
-        {
-            if (hauler?.aQueue == null || hauler.aQueue.Count < 3 || string.IsNullOrEmpty(hauler.strID))
+            if (_interactionInstalled)
                 return;
 
-            HaulBatchRegistry.CleanupHauler(hauler);
-
-            lock (CompactingHaulerIDs)
-            {
-                if (CompactingHaulerIDs.Contains(hauler.strID))
-                    return;
-
-                CompactingHaulerIDs.Add(hauler.strID);
-            }
-
-            var skippedTasks = new List<Task2>();
+            if (!IsDataReady())
+                return;
 
             try
             {
-                if (!TryReadHaulChain(hauler.aQueue, 0, out var primary))
-                    return;
+                EnsureAssetPathRegistered();
 
-                if (!CarriedContainerPlan.TryCreate(hauler, out var carryPlan, out var planReason))
+                if (!DataHandler.dictInteractions.ContainsKey(BigHaulInteraction))
                 {
-                    Plugin.ModInfo("[V2HaulNoCarryPlan] hauler=" + SafeCO(hauler)
-                        + " reason=" + planReason
-                        + " item={" + DescribeItem(primary.Item) + "}");
-                    return;
-                }
-
-                if (carryPlan.HasActiveDragContainer)
-                {
-                    Plugin.ModInfo("[V2ActiveDragHelper] hauler=" + SafeCO(hauler)
-                        + " helper={" + carryPlan.ActiveDragContainerDescription + "}"
-                        + " carry={" + carryPlan.Description + "}");
-                }
-
-                var workManager = CrewSim.objInstance?.workManager;
-                if (workManager == null)
-                    return;
-
-                var destinationShipID = GetDestinationShipID(primary);
-                if (string.IsNullOrEmpty(destinationShipID))
-                    return;
-
-                var dropPlan = new DropDestinationPlanner(hauler);
-                if (!dropPlan.TryRetargetExistingChain(primary, out var primaryDropReason))
-                {
-                    Plugin.ModInfo("[V2DropPlanFallback] hauler=" + SafeCO(hauler)
-                        + " reason=" + primaryDropReason
-                        + " item={" + DescribeItem(primary.Item) + "}");
-                }
-
-                var looseChains = new List<HaulChain>();
-                HaulChain utilityDragChain = null;
-                HaulChain dragChain = null;
-                // Keep draggable work out of loose batching. Attached storage is still used.
-                var allowExtraDrag = false;
-                var allowUtilityDrag = false;
-                var seenItemIDs = new HashSet<string>();
-                if (!string.IsNullOrEmpty(primary.Item?.strID))
-                    seenItemIDs.Add(primary.Item.strID);
-
-                var inventoryClosed = false;
-                var primaryDeferred = false;
-                if (TryClassifyPrimary(hauler, primary, carryPlan, looseChains, ref utilityDragChain, ref dragChain, allowExtraDrag, allowUtilityDrag, out var primaryStopReason))
-                {
-                    inventoryClosed = primaryStopReason == "inventory-full";
-                }
-                else if (ShouldDeferPrimaryForActiveHelper(hauler, workManager, primary, carryPlan, destinationShipID, out var deferReason))
-                {
-                    if (!TryDeferPrimaryHaulChain(workManager, hauler, primary, deferReason, out var deferFailReason))
+                    JsonInteraction source = null;
+                    DataHandler.dictInteractions.TryGetValue("PickupItemStack", out source);
+                    if (source == null)
                     {
-                        Plugin.ModInfo("[V2HelperPrimaryDeferFailed] hauler=" + SafeCO(hauler)
-                            + " reason=" + deferFailReason
-                            + " item={" + DescribeItem(primary.Item) + "}"
-                            + " queue={" + QueueSummary(hauler) + "}");
+                        Warn("Could not create BIG Haul Items: PickupItemStack was missing.");
                         return;
                     }
 
-                    primaryDeferred = true;
-                    if (!string.IsNullOrEmpty(primary.Item?.strID))
-                        seenItemIDs.Remove(primary.Item.strID);
-                }
-                else if (ShouldDeferPrimaryForLooseFit(hauler, workManager, primary, carryPlan, destinationShipID, primaryStopReason, out deferReason))
-                {
-                    if (!TryDeferPrimaryHaulChain(workManager, hauler, primary, deferReason, out var deferFailReason))
-                    {
-                        Plugin.ModInfo("[V2PrimaryDeferFailed] hauler=" + SafeCO(hauler)
-                            + " reason=" + deferFailReason
-                            + " item={" + DescribeItem(primary.Item) + "}"
-                            + " queue={" + QueueSummary(hauler) + "}");
-                        return;
-                    }
+                    var custom = source.Clone();
+                    custom.strName = BigHaulInteraction;
+                    custom.strTitle = "BIG Haul Items";
+                    custom.strDesc = "[us] marks [them] for BIG loose-item hauling.";
+                    custom.strTooltip = "Adds this loose item to BIG's own haul registry.";
+                    custom.strActionGroup = "Work";
+                    custom.strDuty = null;
+                    custom.strMapIcon = BigHaulMarkerIcon;
+                    custom.strBubble = "BblTouch";
+                    custom.aInverse = Array.Empty<string>();
+                    custom.bApplyChain = false;
+                    custom.bOpener = true;
+                    custom.bHumanOnly = true;
+                    custom.bIgnoreFeelings = true;
+                    custom.nLogging = 1;
 
-                    primaryDeferred = true;
-                    if (!string.IsNullOrEmpty(primary.Item?.strID))
-                        seenItemIDs.Remove(primary.Item.strID);
+                    DataHandler.dictInteractions[BigHaulInteraction] = custom;
+                    ModInfo("BIG custom interaction registered: interaction=" + BigHaulInteraction + " mapIcon=" + BigHaulMarkerIcon + ".");
+                }
+
+                _interactionInstalled = true;
+                var added = AddInteractionToLoadedObjects();
+                ModInfo("Installed BIG Haul Items interaction. Loaded candidates updated: " + added + ".");
+            }
+            catch (Exception ex)
+            {
+                Error("Failed to install BIG Haul Items interaction: " + ex);
+            }
+        }
+
+        internal static int AddInteractionToLoadedObjects()
+        {
+            var count = 0;
+
+            try
+            {
+                if (DataHandler.mapCOs == null)
+                    return 0;
+
+                foreach (var co in DataHandler.mapCOs.Values)
+                {
+                    if (TryAddInteractionToCandidate(co))
+                        count++;
+                }
+            }
+            catch (Exception ex)
+            {
+                Warn("Live candidate scan failed: " + ex.Message);
+            }
+
+            return count;
+        }
+
+        internal static bool TryAddInteractionToCandidate(CondOwner co)
+        {
+            string rejectReason;
+            if (!IsLooseWorldHaulCandidate(co, out rejectReason))
+                return false;
+
+            if (co.aInteractions.Contains(BigHaulInteraction))
+                return false;
+
+            co.aInteractions.Add(BigHaulInteraction);
+            return true;
+        }
+
+        internal static bool TryRegisterLooseItem(CondOwner hauler, CondOwner item, out string message)
+        {
+            message = null;
+
+            if (hauler == null)
+            {
+                message = "Rejected BIG haul registration: hauler was null.";
+                return false;
+            }
+
+            if (item == null)
+            {
+                message = "Rejected BIG haul registration for " + SafeName(hauler) + ": item was null.";
+                return false;
+            }
+
+            if (!IsCandidateForMode(hauler, item, BigHaulPaintMode.Haul, out var rejectReason))
+            {
+                message = "Rejected BIG haul registration: " + Describe(item) + " reason=" + rejectReason;
+                return false;
+            }
+
+            var record = BigHaulRegistry.Register(hauler, item, BigHaulPaintMode.Haul);
+            BigHaulRegistry.EnsureIcon(record, item);
+            message = "Registered BIG haul item: " + record;
+            return true;
+        }
+
+        internal static bool BigHaulPaintActive
+        {
+            get { return _bigHaulPaintMode != BigHaulPaintMode.None; }
+        }
+
+        internal static BigHaulPaintMode ActiveBigHaulMode
+        {
+            get { return _bigHaulPaintMode; }
+        }
+
+        internal static void AddBigHaulPanelButton(GUIPDA pda)
+        {
+            try
+            {
+                EnsureAssetPathRegistered();
+
+                if (pda == null || pda.goJobTypes == null)
+                    return;
+
+                var prefabField = AccessTools.Field(typeof(GUIPDA), "prefabGUIJobItem");
+                var prefab = prefabField?.GetValue(pda) as GUIJobItem;
+                if (prefab == null)
+                {
+                    Warn("Could not add BIG HAUL panel button: prefabGUIJobItem was missing.");
+                    return;
+                }
+
+                var added = 0;
+                var refreshed = 0;
+                var removed = RemoveLegacyBigPanelButton(pda.goJobTypes.transform, LegacyCartButtonObjectName);
+
+                if (AddOrRefreshBigPanelButton(pda.goJobTypes.transform, prefab, LooseButtonObjectName, "", LooseButtonIcon, StartBigLooseHaulPainting))
+                    added++;
+                else
+                    refreshed++;
+
+                if (AddOrRefreshBigPanelButton(pda.goJobTypes.transform, prefab, DragButtonObjectName, "", DragButtonIcon, StartBigDragHaulPainting))
+                    added++;
+                else
+                    refreshed++;
+
+                ModInfo("BIG panel buttons ready: added=" + added + " refreshed=" + refreshed + " removedLegacy=" + removed + " icons: haul=" + LooseButtonIcon + " drag=" + DragButtonIcon + ".");
+            }
+            catch (Exception ex)
+            {
+                Warn("Could not add BIG HAUL panel button: " + ex.Message);
+            }
+        }
+
+        private static bool AddOrRefreshBigPanelButton(Transform parent, GUIJobItem prefab, string objectName, string label, string iconKey, UnityEngine.Events.UnityAction action)
+        {
+            var existing = parent.Find(objectName);
+            if (existing != null)
+            {
+                var existingButton = existing.GetComponent<GUIJobItem>();
+                if (existingButton != null)
+                    existingButton.SetData(label, iconKey, action);
+
+                existing.SetAsLastSibling();
+                return false;
+            }
+
+            var button = UnityEngine.Object.Instantiate(prefab, parent);
+            button.gameObject.name = objectName;
+            button.SetData(label, iconKey, action);
+            button.transform.SetAsLastSibling();
+            return true;
+        }
+
+        private static int RemoveLegacyBigPanelButton(Transform parent, string objectName)
+        {
+            try
+            {
+                var existing = parent != null ? parent.Find(objectName) : null;
+                if (existing == null)
+                    return 0;
+
+                UnityEngine.Object.Destroy(existing.gameObject);
+                return 1;
+            }
+            catch (Exception ex)
+            {
+                Warn("Could not remove legacy BIG panel button " + objectName + ": " + ex.Message);
+                return 0;
+            }
+        }
+
+        internal static void StartBigLooseHaulPainting()
+        {
+            StartBigHaulPainting(BigHaulPaintMode.Haul);
+        }
+
+        internal static void StartBigDragHaulPainting()
+        {
+            StartBigHaulPainting(BigHaulPaintMode.Drag);
+        }
+
+        private static void StartBigHaulPainting(BigHaulPaintMode mode)
+        {
+            try
+            {
+                if (mode == BigHaulPaintMode.None)
+                    return;
+
+                var sim = CrewSim.objInstance;
+                if (sim == null)
+                {
+                    Warn("Could not start BIG haul panel mode: CrewSim.objInstance was null.");
+                    return;
+                }
+
+                var oldMode = _bigHaulPaintMode;
+                if (oldMode != BigHaulPaintMode.None || _bigSelectionDragging)
+                    StopBigHaulPainting("mode-switch-to-" + mode);
+
+                var hauler = CrewSim.GetSelectedCrew();
+                ClearVanillaPaintingForBigMode(mode);
+                CancelSelectedCrewVanillaHaulTasks(hauler, "big-mode-start:" + mode);
+
+                if (hauler != null)
+                    BigHaulPlanner.CancelAllForHauler(hauler, "mode-switch:" + mode, true);
+
+                _bigHaulPaintMode = mode;
+                _bigSelectionDragging = false;
+                _bigSelectionStart = Vector2.zero;
+                _bigSelectionEnd = Vector2.zero;
+                _bigSelectionWorldReady = false;
+                _bigSelectionWorldStart = Vector3.zero;
+                _bigSelectionWorldEnd = Vector3.zero;
+                if (oldMode != BigHaulPaintMode.None && oldMode != mode)
+                    ModInfo("[BIGModeSwitch] old=" + oldMode + " new=" + mode + ".");
+                ModInfo("BIG pure selection mode armed: " + mode + ". Drag a box in-world to register items.");
+            }
+            catch (Exception ex)
+            {
+                _bigHaulPaintMode = BigHaulPaintMode.None;
+                Error("Could not start BIG haul panel mode: " + ex);
+            }
+        }
+
+        private static void ClearVanillaPaintingForBigMode(BigHaulPaintMode mode)
+        {
+            try
+            {
+                var sim = CrewSim.objInstance;
+                if (sim == null)
+                    return;
+
+                var previousJob = InstallableSummary(CrewSim.jiLast);
+                var hadPaintJob = sim.goPaintJob != null;
+                var hadSelectedPart = sim.goSelPart != null;
+                sim.FinishPaintingJob();
+                CrewSim.jiLast = null;
+                CrewSim.bContinuePaintingJob = false;
+                sim.goPaintJob = null;
+                sim.goSelPart = null;
+                var cursorReset = InvokeCrewSimSetCursor(sim, 0);
+                var highlightsCleared = InvokeCrewSimNoArg(sim, "ClearHighlightedCos");
+                ModInfo("[BIGVanillaPaintCancel] mode=" + mode
+                    + " previous=" + previousJob
+                    + " hadPaintJob=" + hadPaintJob
+                    + " hadSelectedPart=" + hadSelectedPart
+                    + " resetJiLast=True cursorReset=" + cursorReset
+                    + " highlightsCleared=" + highlightsCleared + ".");
+            }
+            catch (Exception ex)
+            {
+                Warn("[BIGVanillaPaintCancel] failed: mode=" + mode + " error=" + ex.Message);
+            }
+        }
+
+        private static bool InvokeCrewSimSetCursor(CrewSim sim, int cursor)
+        {
+            try
+            {
+                if (sim == null)
+                    return false;
+
+                var method = AccessTools.Method(typeof(CrewSim), "SetCursor", new[] { typeof(int) });
+                if (method == null)
+                    return false;
+
+                method.Invoke(sim, new object[] { cursor });
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Warn("[BIGVanillaPaintCancel] cursor reset failed: " + ex.Message);
+                return false;
+            }
+        }
+
+        private static bool InvokeCrewSimNoArg(CrewSim sim, string methodName)
+        {
+            try
+            {
+                if (sim == null || string.IsNullOrEmpty(methodName))
+                    return false;
+
+                var method = AccessTools.Method(typeof(CrewSim), methodName);
+                if (method == null)
+                    return false;
+
+                method.Invoke(sim, null);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Warn("[BIGVanillaPaintCancel] " + methodName + " failed: " + ex.Message);
+                return false;
+            }
+        }
+
+        internal static void EnsureAssetPathRegistered()
+        {
+            if (_assetPathRegistered)
+                return;
+
+            try
+            {
+                if (DataHandler.aModPaths == null)
+                    return;
+
+                var pluginDir = Path.GetDirectoryName(typeof(Plugin).Assembly.Location);
+                if (string.IsNullOrEmpty(pluginDir))
+                    return;
+
+                var assetRoot = Path.Combine(pluginDir, "BIGAssets") + Path.DirectorySeparatorChar;
+                var imagesDir = Path.Combine(assetRoot, "images");
+                if (!Directory.Exists(imagesDir))
+                {
+                    Warn("BIG icon asset path missing: " + imagesDir);
+                    return;
+                }
+
+                var normalized = Path.GetFullPath(assetRoot);
+                if (!DataHandler.aModPaths.Any(p => string.Equals(Path.GetFullPath(p), normalized, StringComparison.OrdinalIgnoreCase)))
+                    DataHandler.aModPaths.Insert(0, normalized);
+
+                _assetPathRegistered = true;
+                ModInfo("Registered BIG icon asset path: " + normalized);
+                LogIconAssetStatus(imagesDir);
+            }
+            catch (Exception ex)
+            {
+                Warn("Could not register BIG icon asset path: " + ex.Message);
+            }
+        }
+
+        private static void LogIconAssetStatus(string imagesDir)
+        {
+            LogIconAsset(imagesDir, LooseButtonIcon);
+            LogIconAsset(imagesDir, DragButtonIcon);
+            LogIconAsset(imagesDir, BigHaulMarkerIcon);
+        }
+
+        private static void LogIconAsset(string imagesDir, string iconKey)
+        {
+            try
+            {
+                var path = Path.Combine(imagesDir, iconKey + ".png");
+                var file = new FileInfo(path);
+                if (file.Exists)
+                    ModInfo("BIG icon asset found: key=" + iconKey + " file=" + path + " bytes=" + file.Length + ".");
+                else
+                    Warn("BIG icon asset missing: key=" + iconKey + " file=" + path + ".");
+            }
+            catch (Exception ex)
+            {
+                Warn("BIG icon asset check failed: key=" + iconKey + " error=" + ex.Message);
+            }
+        }
+
+        internal static void StopBigHaulPainting(string reason = "stopped")
+        {
+            if (_bigHaulPaintMode == BigHaulPaintMode.None && !_bigSelectionDragging)
+                return;
+
+            var mode = _bigHaulPaintMode;
+            _bigHaulPaintMode = BigHaulPaintMode.None;
+            _bigSelectionDragging = false;
+            _bigSelectionStart = Vector2.zero;
+            _bigSelectionEnd = Vector2.zero;
+            _bigSelectionWorldReady = false;
+            _bigSelectionWorldStart = Vector3.zero;
+            _bigSelectionWorldEnd = Vector3.zero;
+            ModInfo("[BIGModeCancel] mode=" + mode + " reason=" + reason + ".");
+        }
+
+        private static void HandleBigSelectionInput()
+        {
+            try
+            {
+                if (Input.GetKeyDown(KeyCode.Escape))
+                {
+                    StopBigHaulPainting("escape");
+                    return;
+                }
+
+                if (Input.GetMouseButtonDown(1))
+                {
+                    StopBigHaulPainting("right-click");
+                    return;
+                }
+
+                if (Input.GetMouseButtonDown(0))
+                {
+                    _bigSelectionDragging = true;
+                    _bigSelectionStart = Input.mousePosition;
+                    _bigSelectionEnd = _bigSelectionStart;
+                    _bigSelectionWorldReady = TryGetSelectionWorldPoint(_bigSelectionStart, out _bigSelectionWorldStart);
+                    _bigSelectionWorldEnd = _bigSelectionWorldStart;
+                    ModInfo("BIG pure selection drag started: mode=" + _bigHaulPaintMode + " start=" + ScreenPoint(_bigSelectionStart) + " worldAnchored=" + _bigSelectionWorldReady + ".");
+                    return;
+                }
+
+                if (_bigSelectionDragging && Input.GetMouseButton(0))
+                {
+                    _bigSelectionEnd = Input.mousePosition;
+                    UpdateSelectionWorldEnd();
+                    return;
+                }
+
+                if (_bigSelectionDragging && Input.GetMouseButtonUp(0))
+                {
+                    _bigSelectionEnd = Input.mousePosition;
+                    UpdateSelectionWorldEnd();
+                    var mode = _bigHaulPaintMode;
+                    var hauler = CrewSim.GetSelectedCrew();
+                    var summary = RegisterSelectionBox(hauler, mode, _bigSelectionStart, _bigSelectionEnd);
+                    _bigSelectionDragging = false;
+                    _bigSelectionStart = Vector2.zero;
+                    _bigSelectionEnd = Vector2.zero;
+                    _bigSelectionWorldReady = false;
+                    _bigSelectionWorldStart = Vector3.zero;
+                    _bigSelectionWorldEnd = Vector3.zero;
+                    ModInfo("[BIGModeHold] mode=" + mode + " reason=selection-complete.");
+                    ModInfo(summary);
+                }
+            }
+            catch (Exception ex)
+            {
+                Error("BIG pure selection input failed: " + ex);
+                StopBigHaulPainting("input-error");
+            }
+        }
+
+        private static void DrawBigSelectionBox()
+        {
+            if (!BigHaulPaintActive)
+                return;
+
+            DrawBigCursorIcon();
+
+            if (_bigSelectionDragging)
+            {
+                Rect rect;
+                if (!TryGetSelectionGuiRect(out rect))
+                    rect = ToGuiRect(_bigSelectionStart, _bigSelectionEnd);
+
+                if (rect.width < 2f || rect.height < 2f)
+                    return;
+
+                var modeColor = ModeColor(_bigHaulPaintMode);
+                var old = GUI.color;
+                GUI.color = new Color(modeColor.r, modeColor.g, modeColor.b, 0.25f);
+                GUI.DrawTexture(rect, Texture2D.whiteTexture);
+                GUI.color = new Color(modeColor.r, modeColor.g, modeColor.b, 0.95f);
+                DrawRectBorder(rect, 2f);
+                GUI.color = old;
+            }
+        }
+
+        private static void DrawBigCursorIcon()
+        {
+            try
+            {
+                var texture = GetCursorTextureForMode(_bigHaulPaintMode);
+                var mouse = Event.current.mousePosition;
+                var modeColor = ModeColor(_bigHaulPaintMode);
+                var iconRect = new Rect(mouse.x + 10f, mouse.y + 10f, 36f, 36f);
+                var labelRect = new Rect(mouse.x - 2f, mouse.y + 48f, 72f, 18f);
+                var old = GUI.color;
+
+                GUI.color = new Color(0f, 0f, 0f, 0.68f);
+                GUI.DrawTexture(iconRect, Texture2D.whiteTexture);
+                GUI.color = new Color(modeColor.r, modeColor.g, modeColor.b, 0.95f);
+                DrawRectBorder(iconRect, 1f);
+
+                if (texture != null)
+                {
+                    GUI.color = Color.white;
+                    GUI.DrawTexture(new Rect(iconRect.x + 2f, iconRect.y + 2f, 32f, 32f), texture);
+                }
+
+                GUI.color = new Color(0f, 0f, 0f, 0.68f);
+                GUI.DrawTexture(labelRect, Texture2D.whiteTexture);
+                var style = new GUIStyle(GUI.skin.label);
+                style.normal.textColor = new Color(modeColor.r, modeColor.g, modeColor.b, 1f);
+                style.fontStyle = FontStyle.Bold;
+                style.alignment = TextAnchor.MiddleCenter;
+                GUI.Label(labelRect, ModeLabel(_bigHaulPaintMode).ToUpperInvariant(), style);
+                GUI.color = old;
+            }
+            catch
+            {
+                // Cursor feedback must not affect hauling.
+            }
+        }
+
+        private static Texture2D GetCursorTextureForMode(BigHaulPaintMode mode)
+        {
+            if (_cursorTexture != null && _cursorTextureMode == mode)
+                return _cursorTexture;
+
+            _cursorTexture = null;
+            _cursorTextureMode = mode;
+
+            var iconKey = IconKeyForMode(mode);
+            if (string.IsNullOrEmpty(iconKey))
+                return null;
+
+            try
+            {
+                Texture2D texture;
+                if (DataHandler.dictImages == null || !DataHandler.dictImages.TryGetValue(iconKey, out texture))
+                    return null;
+
+                _cursorTexture = texture;
+                return _cursorTexture;
+            }
+            catch (Exception ex)
+            {
+                Warn("BIG cursor icon load failed: mode=" + mode + " error=" + ex.Message);
+                return null;
+            }
+        }
+
+        private static string IconKeyForMode(BigHaulPaintMode mode)
+        {
+            switch (mode)
+            {
+                case BigHaulPaintMode.Haul:
+                    return LooseButtonIcon;
+                case BigHaulPaintMode.Drag:
+                    return DragButtonIcon;
+                default:
+                    return null;
+            }
+        }
+
+        private static Color ModeColor(BigHaulPaintMode mode)
+        {
+            switch (mode)
+            {
+                case BigHaulPaintMode.Haul:
+                    return new Color(0.75f, 1f, 0.15f, 1f);
+                case BigHaulPaintMode.Drag:
+                    return new Color(1f, 0.55f, 0.15f, 1f);
+                default:
+                    return Color.white;
+            }
+        }
+
+        private static void DrawRectBorder(Rect rect, float thickness)
+        {
+            GUI.DrawTexture(new Rect(rect.xMin, rect.yMin, rect.width, thickness), Texture2D.whiteTexture);
+            GUI.DrawTexture(new Rect(rect.xMin, rect.yMax - thickness, rect.width, thickness), Texture2D.whiteTexture);
+            GUI.DrawTexture(new Rect(rect.xMin, rect.yMin, thickness, rect.height), Texture2D.whiteTexture);
+            GUI.DrawTexture(new Rect(rect.xMax - thickness, rect.yMin, thickness, rect.height), Texture2D.whiteTexture);
+        }
+
+        private static Rect ToGuiRect(Vector2 start, Vector2 end)
+        {
+            var xMin = Math.Min(start.x, end.x);
+            var xMax = Math.Max(start.x, end.x);
+            var yMin = Math.Min(Screen.height - start.y, Screen.height - end.y);
+            var yMax = Math.Max(Screen.height - start.y, Screen.height - end.y);
+            return Rect.MinMaxRect(xMin, yMin, xMax, yMax);
+        }
+
+        private static Rect ToScreenRect(Vector2 start, Vector2 end)
+        {
+            var xMin = Math.Min(start.x, end.x);
+            var xMax = Math.Max(start.x, end.x);
+            var yMin = Math.Min(start.y, end.y);
+            var yMax = Math.Max(start.y, end.y);
+
+            if (xMax - xMin < 8f)
+            {
+                xMin -= 4f;
+                xMax += 4f;
+            }
+
+            if (yMax - yMin < 8f)
+            {
+                yMin -= 4f;
+                yMax += 4f;
+            }
+
+            return Rect.MinMaxRect(xMin, yMin, xMax, yMax);
+        }
+
+        private static bool TryGetSelectionWorldPoint(Vector2 screen, out Vector3 world)
+        {
+            world = Vector3.zero;
+
+            try
+            {
+                var sim = CrewSim.objInstance;
+                if (sim == null)
+                    return false;
+
+                var camera = GetCrewSimCamera(sim);
+                if (camera == null)
+                    return false;
+
+                world = ScreenToWorldOnPlane(camera, screen, new Plane(Vector3.forward, Vector3.zero));
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static void UpdateSelectionWorldEnd()
+        {
+            if (!_bigSelectionWorldReady)
+                return;
+
+            Vector3 worldEnd;
+            if (TryGetSelectionWorldPoint(_bigSelectionEnd, out worldEnd))
+                _bigSelectionWorldEnd = worldEnd;
+        }
+
+        private static bool TryGetSelectionGuiRect(out Rect rect)
+        {
+            rect = default(Rect);
+
+            if (!_bigSelectionWorldReady)
+                return false;
+
+            Vector2 start;
+            Vector2 end;
+            if (!TryWorldToSelectionScreenPoint(_bigSelectionWorldStart, out start) || !TryWorldToSelectionScreenPoint(_bigSelectionWorldEnd, out end))
+                return false;
+
+            rect = ToGuiRect(start, end);
+            return true;
+        }
+
+        private static bool TryWorldToSelectionScreenPoint(Vector3 world, out Vector2 screen)
+        {
+            screen = Vector2.zero;
+
+            try
+            {
+                var sim = CrewSim.objInstance;
+                if (sim == null)
+                    return false;
+
+                var camera = GetCrewSimCamera(sim);
+                if (camera == null)
+                    return false;
+
+                var point = camera.WorldToScreenPoint(world);
+                if (point.z < 0f)
+                    return false;
+
+                screen = new Vector2(point.x, point.y);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static Bounds WorldSelectionBounds(Vector3 start, Vector3 end)
+        {
+            var min = Vector3.Min(start, end);
+            var max = Vector3.Max(start, end);
+            return FlattenFor2D(new Bounds((min + max) * 0.5f, max - min));
+        }
+
+        private static string RegisterSelectionBox(CondOwner hauler, BigHaulPaintMode mode, Vector2 start, Vector2 end)
+        {
+            if (hauler == null)
+                return "BIG pure selection failed: no selected crew.";
+
+            if (DataHandler.mapCOs == null)
+                return "BIG pure selection failed: DataHandler.mapCOs was null.";
+
+            Bounds selectionBounds;
+            string cameraInfo;
+            if (_bigSelectionWorldReady)
+            {
+                selectionBounds = WorldSelectionBounds(_bigSelectionWorldStart, _bigSelectionWorldEnd);
+                var camera = GetCrewSimCamera(CrewSim.objInstance);
+                cameraInfo = (camera != null ? CameraSummary(camera) : "<none>") + " conversion=world-anchored-selection";
+            }
+            else if (!TryGetSelectionWorldBounds(start, end, out selectionBounds, out cameraInfo))
+            {
+                return "BIG pure selection failed: could not calculate world bounds.";
+            }
+
+            var seen = new HashSet<string>();
+            var accepted = 0;
+            var rejected = 0;
+            var outside = 0;
+            var noBounds = 0;
+            var containerBlocked = 0;
+            var queued = 0;
+            var firstRejects = new List<string>();
+            var selectedItems = new List<CondOwner>();
+
+            foreach (var item in DataHandler.mapCOs.Values.ToList())
+            {
+                if (item == null || item == hauler)
+                    continue;
+
+                var id = SafeValue(() => item.strID);
+                if (!string.IsNullOrEmpty(id) && id != "<null>" && !seen.Add(id))
+                    continue;
+
+                if (HasContainerOwner(item))
+                {
+                    containerBlocked++;
+                    continue;
+                }
+
+                Bounds itemBounds;
+                if (!TryGetItemWorldBounds(item, out itemBounds))
+                {
+                    noBounds++;
+                    continue;
+                }
+
+                if (!Overlaps2D(selectionBounds, itemBounds))
+                {
+                    outside++;
+                    continue;
+                }
+
+                string dragRejectReason;
+                if (!IsDragSelectableWorldObject(item, out dragRejectReason))
+                {
+                    rejected++;
+                    if (firstRejects.Count < 8)
+                        firstRejects.Add("Rejected BIG " + ModeLabel(mode) + " registration: " + Describe(item) + " reason=" + dragRejectReason);
+                    continue;
+                }
+
+                string message;
+                if (TryRegisterItemForMode(hauler, item, mode, out message))
+                {
+                    accepted++;
+                    selectedItems.Add(item);
+                    ModInfo("BIG pure selection captured: " + message);
                 }
                 else
                 {
-                    if (TryQueueActiveHelperReleaseBeforePrimary(hauler, workManager, primary, carryPlan, dropPlan, out var releaseReason))
-                    {
-                        Plugin.ModInfo("[V2ActiveHelperReleaseQueued] hauler=" + SafeCO(hauler)
-                            + " reason=" + releaseReason
-                            + " helper={" + carryPlan.ActiveDragContainerDescription + "}"
-                            + " primary={" + DescribeItem(primary.Item) + "}"
-                            + " queue={" + QueueSummary(hauler) + "}");
-                        return;
-                    }
-
-                    if (TryQueueControlledPrimaryDrag(hauler, workManager, primary, dropPlan, primaryStopReason, out var dragReason))
-                    {
-                        Plugin.ModInfo("[V2PrimaryControlledDrag] hauler=" + SafeCO(hauler)
-                            + " reason=" + dragReason
-                            + " item={" + DescribeItem(primary.Item) + "}"
-                            + " queue={" + QueueSummary(hauler) + "}");
-                        return;
-                    }
-
-                    return;
-                }
-
-                for (var i = 1; i < HardSafetyLimit; i++)
-                {
-                    var task = workManager.ClaimNextTask(hauler);
-                    if (task == null)
-                        break;
-
-                    if (!TryReadClaimedHaulTask(hauler, task, dropPlan, out var item, out var tile, out var readReason))
-                    {
-                        workManager.UnclaimTask(task);
-                        Plugin.ModInfo("[V2HaulClaimStop] hauler=" + SafeCO(hauler)
-                            + " reason=" + readReason);
-                        break;
-                    }
-
-                    if (!string.IsNullOrEmpty(item?.strID) && seenItemIDs.Contains(item.strID))
-                    {
-                        task.fLastCheck = StarSystem.fEpoch;
-                        skippedTasks.Add(task);
-                        Plugin.ModInfo("[V2HaulSkipForLater] hauler=" + SafeCO(hauler)
-                            + " reason=duplicate"
-                            + " item={" + DescribeItem(item) + "}");
-                        continue;
-                    }
-
-                    if (!string.Equals(task.strTileShip, destinationShipID, StringComparison.OrdinalIgnoreCase))
-                    {
-                        task.fLastCheck = StarSystem.fEpoch;
-                        skippedTasks.Add(task);
-                        Plugin.ModInfo("[V2HaulSkipForLater] hauler=" + SafeCO(hauler)
-                            + " reason=destination-mismatch"
-                            + " item={" + DescribeItem(item) + "}");
-                        continue;
-                    }
-
-                    if (carryPlan.IsActiveDragContainer(item))
-                    {
-                        skippedTasks.Add(task);
-                        Plugin.ModInfo("[V2HelperCargoSkipped] hauler=" + SafeCO(hauler)
-                            + " reason=active-drag-helper"
-                            + " item={" + DescribeItem(item) + "}");
-                        continue;
-                    }
-
-                    if (!IsBatchableLoosePickup(hauler, item, carryPlan, out var itemReason))
-                    {
-                        if (allowUtilityDrag && utilityDragChain == null && TryPlanUtilityDragContainer(hauler, task, item, tile, carryPlan, out utilityDragChain, out var utilityReason))
-                        {
-                            Plugin.ModInfo("[V2UtilityDragAdded] hauler=" + SafeCO(hauler)
-                                + " reason=" + utilityReason
-                                + " item={" + DescribeItem(item) + "}");
-                            if (!string.IsNullOrEmpty(item.strID))
-                                seenItemIDs.Add(item.strID);
-                            continue;
-                        }
-
-                        if (allowExtraDrag && utilityDragChain == null && dragChain == null && IsOneTripDragCandidate(hauler, item, out var dragReason))
-                        {
-                            if (!TryQueueVanillaHaulChain(hauler, task, item, tile, out dragChain, out var dragQueueReason))
-                            {
-                                workManager.UnclaimTask(task);
-                                Plugin.ModInfo("[V2HaulDragQueueStop] hauler=" + SafeCO(hauler)
-                                    + " reason=" + dragQueueReason
-                                    + " item={" + DescribeItem(item) + "}");
-                                break;
-                            }
-
-                            Plugin.ModInfo("[V2HaulDragAdded] hauler=" + SafeCO(hauler)
-                                + " reason=" + dragReason
-                                + " item={" + DescribeItem(item) + "}");
-                            if (inventoryClosed)
-                                break;
-                        }
-                        else
-                        {
-                            skippedTasks.Add(task);
-                            Plugin.ModInfo("[V2HaulSkipForLater] hauler=" + SafeCO(hauler)
-                                + " reason=" + itemReason
-                                + " item={" + DescribeItem(item) + "}");
-                        }
-                        continue;
-                    }
-
-                    if (inventoryClosed)
-                    {
-                        workManager.UnclaimTask(task);
-                        Plugin.ModInfo("[V2HaulInventoryClosedStop] hauler=" + SafeCO(hauler)
-                            + " reason=inventory-closed"
-                            + " plannedItems=" + looseChains.Count
-                            + " utilityDrag=" + (utilityDragChain != null)
-                            + " dragAdded=" + (dragChain != null)
-                            + " item={" + DescribeItem(item) + "}");
-                        break;
-                    }
-
-                    if (!carryPlan.TryReserve(item, out var reserveReason))
-                    {
-                        if (allowUtilityDrag && utilityDragChain == null && IsDragReserveStop(reserveReason) && TryPlanUtilityDragContainer(hauler, task, item, tile, carryPlan, out utilityDragChain, out var reserveUtilityReason))
-                        {
-                            Plugin.ModInfo("[V2UtilityDragAdded] hauler=" + SafeCO(hauler)
-                                + " reason=" + reserveUtilityReason + "/" + reserveReason
-                                + " item={" + DescribeItem(item) + "}");
-                            if (!string.IsNullOrEmpty(item.strID))
-                                seenItemIDs.Add(item.strID);
-                            continue;
-                        }
-
-                        if (allowExtraDrag && utilityDragChain == null && IsDragReserveStop(reserveReason) && dragChain == null && IsOneTripDragCandidate(hauler, item, out var reserveDragReason))
-                        {
-                            if (!TryQueueVanillaHaulChain(hauler, task, item, tile, out dragChain, out var dragQueueReason))
-                            {
-                                workManager.UnclaimTask(task);
-                                Plugin.ModInfo("[V2HaulDragQueueStop] hauler=" + SafeCO(hauler)
-                                    + " reason=" + dragQueueReason
-                                    + " item={" + DescribeItem(item) + "}");
-                                break;
-                            }
-
-                            Plugin.ModInfo("[V2HaulDragAdded] hauler=" + SafeCO(hauler)
-                                + " reason=" + reserveDragReason + "/" + reserveReason
-                                + " item={" + DescribeItem(item) + "}");
-                            continue;
-                        }
-
-                        if (reserveReason == "no-grid-room")
-                        {
-                            inventoryClosed = true;
-                            workManager.UnclaimTask(task);
-                            Plugin.ModInfo("[V2HaulCapacityStop] hauler=" + SafeCO(hauler)
-                                + " reason=" + reserveReason
-                                + " plannedItems=" + looseChains.Count
-                                + " dragAdded=" + (dragChain != null)
-                                + " carry={" + carryPlan.Description + "}"
-                                + " item={" + DescribeItem(item) + "}");
-                            break;
-                        }
-
-                        skippedTasks.Add(task);
-                        continue;
-                    }
-
-                    if (!TryQueueVanillaHaulChain(hauler, task, item, tile, out var chain, out var queueReason))
-                    {
-                        workManager.UnclaimTask(task);
-                        Plugin.ModInfo("[V2HaulQueueStop] hauler=" + SafeCO(hauler)
-                            + " reason=" + queueReason
-                            + " item={" + DescribeItem(item) + "}");
-                        break;
-                    }
-
-                    looseChains.Add(chain);
-                    if (!string.IsNullOrEmpty(item.strID))
-                        seenItemIDs.Add(item.strID);
-                }
-
-                foreach (var skipped in skippedTasks)
-                    workManager.UnclaimTask(skipped);
-
-                skippedTasks.Clear();
-
-                SortPickupChainsNearestNeighbor(hauler, looseChains);
-
-                var chains = new List<HaulChain>(looseChains);
-                if (utilityDragChain == null && dragChain != null)
-                    chains.Add(dragChain);
-
-                if (utilityDragChain != null && looseChains.Count == 0)
-                {
-                    Plugin.ModInfo("[V2UtilityDragNoLoose] hauler=" + SafeCO(hauler)
-                        + " reason=no-loose-items"
-                        + " item={" + DescribeItem(utilityDragChain.Item) + "}"
-                        + " queue={" + QueueSummary(hauler) + "}");
-                    return;
-                }
-
-                if (chains.Count <= 1 && utilityDragChain == null)
-                {
-                    if (primaryDeferred)
-                    {
-                        Plugin.ModInfo("[V2PrimaryDeferredNoBatch] hauler=" + SafeCO(hauler)
-                            + " reason=not-enough-loose-claimed"
-                            + " loose=" + looseChains.Count
-                            + " queue={" + QueueSummary(hauler) + "}");
-                    }
-
-                    return;
-                }
-
-                CompactLeadingHaulChains(hauler, utilityDragChain, chains);
-
-                var registryChains = new List<HaulChain>(chains);
-                if (utilityDragChain != null)
-                    registryChains.Add(utilityDragChain);
-
-                HaulBatchRegistry.Register(hauler, registryChains);
-
-                Plugin.ModInfo("[V2HaulCompacted] hauler=" + SafeCO(hauler)
-                    + " items=" + chains.Count
-                    + " loose=" + looseChains.Count
-                    + " drag=" + (utilityDragChain == null && dragChain != null)
-                    + " utilityDrag=" + (utilityDragChain != null)
-                    + " destinationShip=" + destinationShipID
-                    + " carry={" + carryPlan.Description + "}"
-                    + " queue={" + QueueSummary(hauler) + "}");
-            }
-            finally
-            {
-                var workManager = CrewSim.objInstance?.workManager;
-                if (workManager != null)
-                {
-                    foreach (var skipped in skippedTasks)
-                        workManager.UnclaimTask(skipped);
-                }
-
-                lock (CompactingHaulerIDs)
-                {
-                    CompactingHaulerIDs.Remove(hauler.strID);
+                    rejected++;
+                    if (firstRejects.Count < 8)
+                        firstRejects.Add(message);
                 }
             }
+
+            foreach (var reject in firstRejects)
+                Warn("BIG pure selection rejected: " + reject);
+
+            if (accepted == 0)
+                LogSelectionMissSamples(selectionBounds);
+
+            if (mode == BigHaulPaintMode.Haul && selectedItems.Count > 0)
+                queued = BigHaulPlanner.StartLooseSession(hauler, selectedItems);
+            else if (mode == BigHaulPaintMode.Drag && selectedItems.Count > 0)
+                queued = BigHaulPlanner.StartDragSession(hauler, selectedItems);
+            else if (selectedItems.Count > 0)
+                Warn("BIG " + mode + " selection is marker-only in this prototype. No vanilla haul tasks were queued.");
+
+            return "BIG pure selection complete: mode=" + mode
+                + " hauler=" + SafeName(hauler)
+                + " rect=" + ScreenPoint(start) + "->" + ScreenPoint(end)
+                + " camera=" + cameraInfo
+                + " bounds=" + BoundsSummary(selectionBounds)
+                + " accepted=" + accepted
+                + " queued=" + queued
+                + " rejected=" + rejected
+                + " containerBlocked=" + containerBlocked
+                + " outside=" + outside
+                + " noBounds=" + noBounds
+                + " queue=" + QueueSummary(hauler) + ".";
         }
 
-        private static bool ShouldDeferPrimaryForActiveHelper(CondOwner hauler, WorkManager workManager, HaulChain primary, CarriedContainerPlan carryPlan, string destinationShipID, out string reason)
+        internal static int CancelBigItemsInBounds(CondOwner hauler, Bounds selectionBounds, string reason)
         {
-            reason = "other";
-            if (hauler == null || workManager == null || primary?.Item == null || carryPlan == null)
+            if (DataHandler.mapCOs == null)
+                return 0;
+
+            selectionBounds = FlattenFor2D(selectionBounds);
+            var seen = new HashSet<string>();
+            var tracked = 0;
+            var matched = 0;
+            var cancelled = 0;
+            var noBounds = 0;
+
+            foreach (var item in DataHandler.mapCOs.Values.ToList())
             {
-                reason = "null";
-                return false;
+                if (item == null)
+                    continue;
+
+                var id = SafeValue(() => item.strID);
+                if (string.IsNullOrEmpty(id) || id == "<null>" || !seen.Add(id))
+                    continue;
+
+                if (!BigHaulRegistry.IsTracked(item))
+                    continue;
+
+                tracked++;
+                Bounds itemBounds;
+                if (!TryGetItemWorldBounds(item, out itemBounds))
+                {
+                    noBounds++;
+                    continue;
+                }
+
+                if (!Overlaps2D(selectionBounds, itemBounds))
+                    continue;
+
+                matched++;
+                if (BigHaulPlanner.CancelPendingItemById(id, reason))
+                    cancelled++;
             }
 
-            if (!carryPlan.HasActiveDragContainer)
-            {
-                reason = "no-active-drag-helper";
-                return false;
-            }
-
-            if (!HasLooseHaulTaskAvailable(hauler, workManager, carryPlan, destinationShipID, out var looseCount, out var firstLoose, out var probeReason))
-            {
-                reason = probeReason;
-                Plugin.ModInfo("[V2HelperPrimaryNotDeferred] hauler=" + SafeCO(hauler)
-                    + " reason=" + reason
-                    + " helper={" + carryPlan.ActiveDragContainerDescription + "}"
-                    + " primary={" + DescribeItem(primary.Item) + "}");
-                return false;
-            }
-
-            reason = (carryPlan.IsActiveDragContainer(primary.Item) ? "active-helper-primary" : "drag-primary")
-                + "/looseAvailable=" + looseCount
-                + "/firstLoose=" + firstLoose;
-            return true;
+            ModInfo("[BIGCancelBounds] hauler=" + SafeName(hauler)
+                + " reason=" + reason
+                + " bounds=" + BoundsSummary(selectionBounds)
+                + " tracked=" + tracked
+                + " matched=" + matched
+                + " cancelled=" + cancelled
+                + " noBounds=" + noBounds + ".");
+            return cancelled;
         }
 
-        private static bool ShouldDeferPrimaryForLooseFit(CondOwner hauler, WorkManager workManager, HaulChain primary, CarriedContainerPlan carryPlan, string destinationShipID, string primaryStopReason, out string reason)
+        internal static bool TryCancelBigItemsFromCurrentVanillaSelection(string reason)
         {
-            reason = "other";
-            if (hauler == null || workManager == null || primary?.Item == null || carryPlan == null)
-            {
-                reason = "null";
-                return false;
-            }
-
-            if (!IsPrimaryLooseDeferrable(primaryStopReason))
-            {
-                reason = "primary-not-deferrable/" + (primaryStopReason ?? "");
-                return false;
-            }
-
-            if (!HasLooseHaulTaskAvailable(hauler, workManager, carryPlan, destinationShipID, out var looseCount, out var firstLoose, out var probeReason))
-            {
-                reason = probeReason;
-                Plugin.ModInfo("[V2PrimaryNotDeferred] hauler=" + SafeCO(hauler)
-                    + " reason=" + reason
-                    + " primaryReason=" + primaryStopReason
-                    + " primary={" + DescribeItem(primary.Item) + "}");
-                return false;
-            }
-
-            reason = "primary-" + primaryStopReason
-                + "/looseAvailable=" + looseCount
-                + "/firstLoose=" + firstLoose;
-            return true;
-        }
-
-        private static bool IsPrimaryLooseDeferrable(string reason)
-        {
-            return reason == "container-reject"
-                || reason == "too-large"
-                || reason == "no-grid-room"
-                || reason == "drag-only"
-                || reason == "no-pickup-stack";
-        }
-
-        private static bool HasLooseHaulTaskAvailable(CondOwner hauler, WorkManager workManager, CarriedContainerPlan carryPlan, string destinationShipID, out int looseCount, out string firstLoose, out string reason)
-        {
-            looseCount = 0;
-            firstLoose = "<none>";
-            reason = "other";
-
-            List<Task2> tasks;
             try
             {
-                tasks = workManager.GetAllTasks();
+                var sim = CrewSim.objInstance;
+                if (sim == null)
+                    return false;
+
+                var start = new Vector2(sim.vDragStartScreen.x, sim.vDragStartScreen.y);
+                var end = new Vector2(Input.mousePosition.x, Input.mousePosition.y);
+                var key = ScreenPoint(start) + "->" + ScreenPoint(end);
+                var now = Time.realtimeSinceStartup;
+                if (key == _lastCancelBoundsScanKey && now - _lastCancelBoundsScanTime < 0.25f)
+                    return false;
+
+                Bounds bounds;
+                string cameraInfo;
+                if (!TryGetSelectionWorldBounds(start, end, out bounds, out cameraInfo))
+                {
+                    Warn("[BIGCancelBounds] failed to calculate vanilla cancel bounds from screen selection " + key + ".");
+                    return false;
+                }
+
+                _lastCancelBoundsScanKey = key;
+                _lastCancelBoundsScanTime = now;
+                var hauler = CrewSim.GetSelectedCrew();
+                var cancelled = CancelBigItemsInBounds(hauler, bounds, reason);
+                ModInfo("[BIGCancelBounds] source=vanilla-current-selection rect=" + key + " camera=" + cameraInfo + " cancelled=" + cancelled + ".");
+                return cancelled > 0;
+            }
+            catch (Exception ex)
+            {
+                Warn("[BIGCancelBounds] vanilla current selection failed: " + ex.Message);
+                return false;
+            }
+        }
+
+        internal static bool IsVanillaCancelPaintJob(CrewSim sim)
+        {
+            try
+            {
+                var ji = CrewSim.jiLast;
+                if (sim == null || ji == null)
+                    return false;
+
+                return ContainsCancelToken(ji.strName)
+                    || ContainsCancelToken(ji.strJobType)
+                    || ContainsCancelToken(ji.strInteractionName)
+                    || ContainsCancelToken(ji.strInteractionTemplate)
+                    || ContainsCancelToken(ji.strActionGroup)
+                    || ContainsCancelToken(ji.strActionCO)
+                    || ContainsCancelToken(ji.strBuildType);
             }
             catch
             {
                 return false;
             }
+        }
 
-            if (tasks == null)
+        internal static bool IsVanillaHaulPaintJob(JsonInstallable ji)
+        {
+            try
             {
-                reason = "no-task-list";
+                if (ji == null)
+                    return false;
+
+                return ContainsHaulToken(ji.strName)
+                    || ContainsHaulToken(ji.strJobType)
+                    || ContainsHaulToken(ji.strInteractionName)
+                    || ContainsHaulToken(ji.strInteractionTemplate)
+                    || ContainsHaulToken(ji.strActionGroup)
+                    || ContainsHaulToken(ji.strActionCO)
+                    || ContainsHaulToken(ji.strBuildType);
+            }
+            catch
+            {
                 return false;
             }
+        }
 
-            if (!CarriedContainerPlan.TryCreate(hauler, out var probePlan, out var planReason, log: false))
+        internal static int CancelSelectedCrewVanillaHaulTasks(CondOwner hauler, string reason)
+        {
+            try
             {
-                reason = "no-probe-plan/" + planReason;
-                return false;
-            }
+                var sim = CrewSim.objInstance;
+                var workManager = sim != null ? sim.workManager : null;
+                if (workManager == null)
+                    return 0;
 
-            var scannedLoose = 0;
-            var firstBlocked = "<none>";
+                var tasks = workManager.GetAllTasks();
+                if (tasks == null || tasks.Count == 0)
+                    return 0;
 
-            foreach (var task in tasks)
-            {
-                if (!IsHaulTask(task))
-                    continue;
+                var considered = 0;
+                var cancelled = 0;
 
-                if (!string.IsNullOrEmpty(destinationShipID)
-                    && !string.IsNullOrEmpty(task.strTileShip)
-                    && !string.Equals(task.strTileShip, destinationShipID, StringComparison.OrdinalIgnoreCase))
+                foreach (var task in tasks.ToList())
                 {
-                    continue;
-                }
-
-                CondOwner item = null;
-                try
-                {
-                    if (string.IsNullOrEmpty(task.strTargetCOID) || !DataHandler.mapCOs.TryGetValue(task.strTargetCOID, out item))
+                    if (!IsVanillaHaulTask(task))
                         continue;
-                }
-                catch
-                {
-                    continue;
-                }
 
-                if (carryPlan != null && carryPlan.IsActiveDragContainer(item))
-                    continue;
+                    considered++;
+                    workManager.RemoveTask(task);
+                    cancelled++;
 
-                if (!IsBatchableLoosePickup(hauler, item, carryPlan, out _))
-                    continue;
-
-                scannedLoose++;
-                if (!probePlan.TryReserve(item, out var reserveReason))
-                {
-                    if (firstBlocked == "<none>")
-                        firstBlocked = SafeCO(item) + "/" + reserveReason;
-
-                    continue;
+                    if (cancelled <= 6)
+                        ModInfo("[BIGVanillaHaulCancelItem] reason=" + reason + " task=" + DescribeVanillaTask(task) + ".");
                 }
 
-                looseCount++;
-                firstLoose = SafeCO(item);
-                reason = "loose-fit/scanned=" + scannedLoose;
+                if (considered > 0 || cancelled > 0)
+                    ModInfo("[BIGVanillaHaulCancel] hauler=" + SafeName(hauler)
+                        + " reason=" + reason
+                        + " considered=" + considered
+                        + " cancelled=" + cancelled
+                        + " skipped=0.");
+
+                return cancelled;
+            }
+            catch (Exception ex)
+            {
+                Warn("[BIGVanillaHaulCancel] failed: reason=" + reason + " error=" + ex.Message);
+                return 0;
+            }
+        }
+
+        private static bool IsVanillaHaulTask(Task2 task)
+        {
+            return task != null
+                && string.Equals(task.strDuty, "Haul", StringComparison.OrdinalIgnoreCase)
+                && string.Equals(task.strInteraction, "ACTHaulItem", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string DescribeVanillaTask(Task2 task)
+        {
+            if (task == null)
+                return "<null>";
+
+            return "name=" + (task.strName ?? "<unnamed>")
+                + " duty=" + (task.strDuty ?? "<null>")
+                + " interaction=" + (task.strInteraction ?? "<null>")
+                + " targetId=" + (task.strTargetCOID ?? "<null>")
+                + " manual=" + task.bManual;
+        }
+
+        internal static string InstallableSummary(JsonInstallable ji)
+        {
+            if (ji == null)
+                return "<null>";
+
+            return "name=" + (ji.strName ?? "<null>")
+                + " job=" + (ji.strJobType ?? "<null>")
+                + " ia=" + (ji.strInteractionName ?? "<null>")
+                + " template=" + (ji.strInteractionTemplate ?? "<null>")
+                + " actionCO=" + (ji.strActionCO ?? "<null>");
+        }
+
+        private static bool ContainsCancelToken(string value)
+        {
+            return !string.IsNullOrEmpty(value)
+                && value.IndexOf("cancel", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static bool ContainsHaulToken(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+                return false;
+
+            return value.IndexOf("haul", StringComparison.OrdinalIgnoreCase) >= 0
+                || value.IndexOf("ACTHaulItem", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static bool TryGetSelectionWorldBounds(Vector2 start, Vector2 end, out Bounds bounds, out string cameraInfo)
+        {
+            bounds = default(Bounds);
+            cameraInfo = "<none>";
+
+            try
+            {
+                var sim = CrewSim.objInstance;
+                if (sim == null)
+                    return false;
+
+                var camera = GetCrewSimCamera(sim);
+                if (camera == null)
+                    return false;
+
+                bounds = ManualScreenToWorldBounds(camera, start, end);
+                bounds = FlattenFor2D(bounds);
+                cameraInfo = CameraSummary(camera) + " conversion=manual-screen-to-world";
                 return true;
             }
-
-            reason = scannedLoose > 0
-                ? "no-loose-fit/scanned=" + scannedLoose + "/firstBlocked=" + firstBlocked
-                : "no-loose-tasks";
-            return false;
+            catch (Exception ex)
+            {
+                Warn("BIG selection world bounds failed: " + ex.Message);
+                return false;
+            }
         }
 
-        private static bool TryQueueActiveHelperReleaseBeforePrimary(CondOwner hauler, WorkManager workManager, HaulChain primary, CarriedContainerPlan carryPlan, DropDestinationPlanner dropPlan, out string reason)
+        private static Camera GetCrewSimCamera(CrewSim sim)
         {
-            reason = "other";
-            if (hauler?.aQueue == null || workManager == null || primary == null || carryPlan == null || !carryPlan.HasActiveDragContainer)
+            try
             {
-                reason = "not-active-helper";
-                return false;
-            }
+                var active = AccessTools.Field(typeof(CrewSim), "ActiveCam")?.GetValue(sim) as Camera;
+                if (active != null && active.isActiveAndEnabled)
+                    return active;
 
-            var helper = carryPlan.ActiveDragContainer;
-            if (helper == null)
+                var main = AccessTools.Field(typeof(CrewSim), "camMain")?.GetValue(sim) as Camera;
+                if (main != null && main.isActiveAndEnabled)
+                    return main;
+
+                if (Camera.main != null && Camera.main.isActiveAndEnabled)
+                    return Camera.main;
+
+                return UnityEngine.Object.FindObjectsByType<Camera>(FindObjectsSortMode.None)
+                    .FirstOrDefault(camera => camera != null && camera.isActiveAndEnabled);
+            }
+            catch
             {
-                reason = "missing-helper";
-                return false;
+                return null;
             }
-
-            var helperTask = FindHaulTaskForItem(workManager, helper);
-            if (!TryResolveActiveHelperReleaseTile(hauler, workManager, helperTask, helper, primary, dropPlan, out var releaseTile, out var tileReason))
-            {
-                reason = "no-release-tile/" + tileReason;
-                return false;
-            }
-
-            var walk = DataHandler.GetInteraction("Walk");
-            var stopDrag = DataHandler.GetInteraction("PickupDragStop");
-            if (walk == null || stopDrag == null)
-            {
-                reason = "missing-interaction";
-                return false;
-            }
-
-            var originalQueue = new List<Interaction>(hauler.aQueue);
-            hauler.aQueue.Clear();
-
-            walk.strTargetPoint = "use";
-            walk.fTargetPointRange = 0f;
-            if (!hauler.QueueInteraction(releaseTile.coProps, walk))
-            {
-                hauler.aQueue.Clear();
-                hauler.aQueue.AddRange(originalQueue);
-                reason = "walk-queue-failed";
-                return false;
-            }
-
-            if (!hauler.QueueInteraction(hauler, stopDrag))
-            {
-                hauler.aQueue.Clear();
-                hauler.aQueue.AddRange(originalQueue);
-                reason = "stop-drag-queue-failed";
-                return false;
-            }
-
-            if (helperTask != null)
-                workManager.RemoveTask(helperTask);
-
-            if (!carryPlan.IsActiveDragContainer(primary.Item))
-                hauler.aQueue.AddRange(originalQueue);
-
-            reason = tileReason + "/removedHelperTask=" + (helperTask != null);
-            return true;
         }
 
-        private static bool TryQueueControlledPrimaryDrag(CondOwner hauler, WorkManager workManager, HaulChain primary, DropDestinationPlanner dropPlan, string primaryStopReason, out string reason)
+        private static Bounds ManualScreenToWorldBounds(Camera camera, Vector2 start, Vector2 end)
         {
-            reason = "other";
-            if (hauler?.aQueue == null || workManager == null || primary?.Item == null)
+            var plane = new Plane(Vector3.forward, Vector3.zero);
+            var p1 = ScreenToWorldOnPlane(camera, start, plane);
+            var p2 = ScreenToWorldOnPlane(camera, end, plane);
+            var min = Vector3.Min(p1, p2);
+            var max = Vector3.Max(p1, p2);
+            return FlattenFor2D(new Bounds((min + max) * 0.5f, max - min));
+        }
+
+        private static Vector3 ScreenToWorldOnPlane(Camera camera, Vector2 screen, Plane plane)
+        {
+            var ray = camera.ScreenPointToRay(new Vector3(screen.x, screen.y, 0f));
+            float enter;
+            if (plane.Raycast(ray, out enter))
+                return ray.GetPoint(enter);
+
+            var fallbackDistance = camera.orthographic
+                ? Mathf.Abs(camera.transform.position.z)
+                : Mathf.Max(1f, Mathf.Abs(camera.transform.position.z));
+
+            return camera.ScreenToWorldPoint(new Vector3(screen.x, screen.y, fallbackDistance));
+        }
+
+        private static Bounds FlattenFor2D(Bounds bounds)
+        {
+            var size = bounds.size;
+            if (Math.Abs(size.x) < 0.25f)
+                size.x = 0.25f;
+            if (Math.Abs(size.y) < 0.25f)
+                size.y = 0.25f;
+            size.z = 10000f;
+
+            return new Bounds(bounds.center, size);
+        }
+
+        private static bool TryGetItemWorldBounds(CondOwner item, out Bounds bounds)
+        {
+            bounds = default(Bounds);
+
+            try
             {
-                reason = "null";
+                if (item == null || item.gameObject == null)
+                    return false;
+
+                var renderers = item.gameObject.GetComponentsInChildren<Renderer>();
+                var hasBounds = false;
+
+                foreach (var renderer in renderers)
+                {
+                    if (renderer == null || !renderer.enabled)
+                        continue;
+
+                    if (!hasBounds)
+                        bounds = renderer.bounds;
+                    else
+                        bounds.Encapsulate(renderer.bounds);
+
+                    hasBounds = true;
+                }
+
+                if (!hasBounds)
+                {
+                    var tf = item.tf != null ? item.tf : item.gameObject.transform;
+                    if (tf == null)
+                        return false;
+
+                    bounds = new Bounds(tf.position, new Vector3(0.5f, 0.5f, 10000f));
+                }
+
+                bounds = FlattenFor2D(bounds);
+                return true;
+            }
+            catch
+            {
                 return false;
             }
+        }
 
-            if (!IsPrimaryLooseDeferrable(primaryStopReason))
+        private static bool Overlaps2D(Bounds a, Bounds b)
+        {
+            return a.min.x <= b.max.x
+                && a.max.x >= b.min.x
+                && a.min.y <= b.max.y
+                && a.max.y >= b.min.y;
+        }
+
+        private static string BoundsSummary(Bounds bounds)
+        {
+            return "center=(" + bounds.center.x.ToString("0.0") + "," + bounds.center.y.ToString("0.0") + ")"
+                + " size=(" + bounds.size.x.ToString("0.0") + "," + bounds.size.y.ToString("0.0") + ")";
+        }
+
+        private static string CameraSummary(Camera camera)
+        {
+            if (camera == null)
+                return "<none>";
+
+            return camera.name
+                + " pos=(" + camera.transform.position.x.ToString("0.0") + "," + camera.transform.position.y.ToString("0.0") + "," + camera.transform.position.z.ToString("0.0") + ")"
+                + " ortho=" + camera.orthographic
+                + " size=" + camera.orthographicSize.ToString("0.0");
+        }
+
+        private static void LogSelectionMissSamples(Bounds selectionBounds)
+        {
+            try
             {
-                reason = "primary-not-drag-fallback/" + (primaryStopReason ?? "");
-                return false;
-            }
+                if (DataHandler.mapCOs == null)
+                    return;
 
-            if (!IsOneTripDragCandidate(hauler, primary.Item, out var dragReason))
+                var samples = new List<string>();
+                foreach (var item in DataHandler.mapCOs.Values)
+                {
+                    if (item == null)
+                        continue;
+
+                    Bounds itemBounds;
+                    if (!TryGetItemWorldBounds(item, out itemBounds))
+                        continue;
+
+                    var center = itemBounds.center;
+                    var dx = center.x - selectionBounds.center.x;
+                    var dy = center.y - selectionBounds.center.y;
+                    var dist = Mathf.Sqrt(dx * dx + dy * dy);
+                    samples.Add(dist.ToString("0.0") + " " + Describe(item) + " pos=(" + center.x.ToString("0.0") + "," + center.y.ToString("0.0") + ") size=(" + itemBounds.size.x.ToString("0.0") + "," + itemBounds.size.y.ToString("0.0") + ")");
+                }
+
+                foreach (var sample in samples.OrderBy(s => float.Parse(s.Split(' ')[0])).Take(8))
+                    ModInfo("BIG selection miss nearest: " + sample);
+            }
+            catch (Exception ex)
             {
-                reason = "not-drag-candidate/" + dragReason;
-                return false;
+                Warn("BIG selection miss sample logging failed: " + ex.Message);
             }
+        }
 
-            var task = FindActivePrimaryHaulTask(workManager, primary);
+        private static string ScreenPoint(Vector2 point)
+        {
+            return "(" + Mathf.RoundToInt(point.x) + "," + Mathf.RoundToInt(point.y) + ")";
+        }
+
+        internal static bool TryRegisterPanelHaulTask(Task2 task, out string message)
+        {
+            message = null;
+
             if (task == null)
             {
-                reason = "active-task-not-found";
+                message = "Rejected BIG panel haul registration: task was null.";
                 return false;
             }
 
-            var tile = ResolveHaulDestination(hauler, task, primary.Item, dropPlan);
-            if (tile?.coProps == null)
+            if (string.IsNullOrEmpty(task.strTargetCOID))
             {
-                reason = "no-destination";
+                message = "Rejected BIG panel haul registration: task target was missing.";
                 return false;
             }
 
-            var pickup = GetDragStartInteraction(hauler, primary.Item, out var pickupReason);
-            var walk = DataHandler.GetInteraction("Walk");
-            var stopDrag = DataHandler.GetInteraction("PickupDragStop");
-            if (pickup == null || walk == null || stopDrag == null)
+            CondOwner item;
+            if (DataHandler.mapCOs == null || !DataHandler.mapCOs.TryGetValue(task.strTargetCOID, out item))
             {
-                reason = "missing-interaction/" + pickupReason;
+                message = "Rejected BIG panel haul registration: target " + task.strTargetCOID + " was not loaded.";
                 return false;
             }
 
-            var originalQueue = new List<Interaction>(hauler.aQueue);
-            var tail = new List<Interaction>();
-            for (var i = 3; i < originalQueue.Count; i++)
-                tail.Add(originalQueue[i]);
+            var hauler = CrewSim.GetSelectedCrew();
+            return TryRegisterItemForMode(hauler, item, ActiveBigHaulMode, out message);
+        }
 
-            hauler.aQueue.Clear();
-            if (!hauler.QueueInteraction(primary.Item, pickup))
+        private static bool TryRegisterItemForMode(CondOwner hauler, CondOwner item, BigHaulPaintMode mode, out string message)
+        {
+            message = null;
+
+            if (hauler == null)
             {
-                RestoreQueue(hauler, originalQueue);
-                reason = "pickup-drag-queue-failed";
+                message = "Rejected BIG " + ModeLabel(mode) + " registration: hauler was null.";
                 return false;
             }
 
-            walk.strTargetPoint = "use";
-            walk.fTargetPointRange = 0f;
-            if (!hauler.QueueInteraction(tile.coProps, walk))
+            if (item == null)
             {
-                RestoreQueue(hauler, originalQueue);
-                reason = "walk-queue-failed";
+                message = "Rejected BIG " + ModeLabel(mode) + " registration for " + SafeName(hauler) + ": item was null.";
                 return false;
             }
 
-            if (!hauler.QueueInteraction(hauler, stopDrag))
+            if (!IsCandidateForMode(hauler, item, mode, out var rejectReason))
             {
-                RestoreQueue(hauler, originalQueue);
-                reason = "stop-drag-queue-failed";
+                message = "Rejected BIG " + ModeLabel(mode) + " registration: " + Describe(item) + " reason=" + rejectReason;
                 return false;
             }
 
-            hauler.aQueue.AddRange(tail);
-            task.strInteraction = pickup.strName;
-            task.SetIA(pickup);
-
-            reason = dragReason + "/primary-" + primaryStopReason + "/dest=" + DescribeTile(tile);
+            var record = BigHaulRegistry.Register(hauler, item, mode);
+            BigHaulRegistry.EnsureIcon(record, item);
+            message = "Registered BIG " + ModeLabel(mode) + " item: " + record;
             return true;
         }
 
-        private static Interaction GetDragStartInteraction(CondOwner hauler, CondOwner item, out string reason)
+        internal static void QueuePickupOnlyIfLoose(CondOwner hauler, CondOwner item, string source)
         {
-            reason = "other";
-            if (CanTrigger(hauler, item, "PickupDragStartNPCPledge"))
+            try
             {
-                reason = "npc-pledge";
+                if (hauler == null || item == null)
+                {
+                    Warn("Pickup-only queue skipped: hauler or item was null. source=" + source);
+                    return;
+                }
+
+                var pickup = GetPickupInteractionForLooseItem(item);
+                if (pickup == null)
+                {
+                    Warn("Pickup-only queue skipped: no pickup interaction was available. item=" + Describe(item));
+                    return;
+                }
+
+                pickup.bManual = true;
+                var queued = hauler.QueueInteraction(item, pickup);
+                if (queued)
+                    ModInfo("Pickup-only queued: source=" + source + " hauler=" + SafeName(hauler) + " item=" + Describe(item) + " queue=" + QueueSummary(hauler));
+                else
+                    Warn("Pickup-only queue failed: source=" + source + " hauler=" + SafeName(hauler) + " item=" + Describe(item) + " queue=" + QueueSummary(hauler));
+            }
+            catch (Exception ex)
+            {
+                Error("Pickup-only queue crashed: source=" + source + " item=" + Describe(item) + " error=" + ex);
+            }
+        }
+
+        internal static string QueueSummary(CondOwner co)
+        {
+            try
+            {
+                if (co?.aQueue == null)
+                    return "<no queue>";
+
+                var count = co.aQueue.Count;
+                var max = Math.Min(count, 8);
+                var parts = new List<string>();
+                for (var i = 0; i < max; i++)
+                {
+                    var interaction = co.aQueue[i];
+                    parts.Add(i + ":" + (interaction?.strName ?? "<null>")
+                        + "->" + SafeName(interaction?.objThem));
+                }
+
+                if (count > max)
+                    parts.Add("+" + (count - max) + " more");
+
+                return "count=" + count + " [" + string.Join(", ", parts.ToArray()) + "]";
+            }
+            catch (Exception ex)
+            {
+                return "<queue summary failed: " + ex.Message + ">";
+            }
+        }
+
+        internal static bool IsCandidateForMode(CondOwner hauler, CondOwner item, BigHaulPaintMode mode, out string reason)
+        {
+            reason = null;
+
+            if (mode == BigHaulPaintMode.None)
+            {
+                reason = "no BIG panel mode active";
+                return false;
+            }
+
+            if (HasAnyCond(item, "IsInstalled", "IsCarried", "IsSystem", "IsHuman", "IsRobot"))
+            {
+                reason = "installed/carried/system/person";
+                return false;
+            }
+
+            if (!IsDirectWorldObject(item, out reason))
+                return false;
+
+            var canDrag = CanDragWorldObject(item);
+            var looseHaulItem = IsLooseHaulItem(item, out var looseRejectReason);
+            var helperHaulItem = IsHelperHaulItem(hauler, item, out var helperRejectReason);
+
+            switch (mode)
+            {
+                case BigHaulPaintMode.Haul:
+                    if (looseHaulItem)
+                        return true;
+
+                    if (helperHaulItem)
+                        return true;
+
+                    reason = helperRejectReason ?? looseRejectReason;
+                    return false;
+
+                case BigHaulPaintMode.Drag:
+                    if (looseHaulItem)
+                    {
+                        reason = "loose item belongs to BIG HAUL";
+                        return false;
+                    }
+
+                    if (canDrag)
+                        return true;
+
+                    reason = "no drag interaction or drag slot";
+                    return false;
+
+                default:
+                    reason = "unknown BIG panel mode";
+                return false;
+            }
+        }
+
+        internal static bool IsHaulCandidateIgnoringCurrentCapacity(CondOwner item, out string reason)
+        {
+            reason = null;
+
+            if (item == null)
+            {
+                reason = "null item";
+                return false;
+            }
+
+            if (item.bDestroyed)
+            {
+                reason = "destroyed";
+                return false;
+            }
+
+            if (HasAnyCond(item, "IsInstalled", "IsCarried", "IsSystem", "IsHuman", "IsRobot"))
+            {
+                reason = "installed/carried/system/person";
+                return false;
+            }
+
+            if (!IsDirectWorldObject(item, out reason))
+                return false;
+
+            if (IsLooseHaulItem(item, out reason))
+                return true;
+
+            if (IsLiquidItem(item))
+            {
+                reason = "liquid contents are not safe for BIG HAUL helper loading yet";
+                return false;
+            }
+
+            if (!HasAnyPickupInteraction(item))
+            {
+                reason = "missing PickupItem/PickupItemStack for helper loading";
+                return false;
+            }
+
+            if (HasAnyCond(item, "IsContainer", "IsCrate", "IsDolly"))
+            {
+                reason = "container/helper item is not helper cargo";
+                return false;
+            }
+
+            reason = "helper cargo waiting for helper space";
+            return true;
+        }
+
+        internal static bool IsLooseWorldHaulCandidate(CondOwner item, out string reason)
+        {
+            reason = null;
+
+            if (item == null)
+            {
+                reason = "null item";
+                return false;
+            }
+
+            if (item.bDestroyed)
+            {
+                reason = "destroyed";
+                return false;
+            }
+
+            if (HasAnyCond(item, "IsInstalled", "IsCarried", "IsSystem", "IsHuman", "IsRobot"))
+            {
+                reason = "installed/carried/system/person";
+                return false;
+            }
+
+            if (!IsDirectWorldObject(item, out reason))
+                return false;
+
+            return IsLooseHaulItem(item, out reason);
+        }
+
+        internal static bool IsDragSelectableWorldObject(CondOwner item, out string reason)
+        {
+            return IsDirectWorldObject(item, out reason);
+        }
+
+        private static bool HasContainerOwner(CondOwner item)
+        {
+            try
+            {
+                return item != null && item.objCOParent != null;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool IsDirectWorldObject(CondOwner item, out string reason)
+        {
+            reason = null;
+
+            if (item == null)
+            {
+                reason = "null item";
+                return false;
+            }
+
+            if (item.objCOParent != null)
+            {
+                reason = "inside container/owner " + SafeName(item.objCOParent);
+                return false;
+            }
+
+            if (item.gameObject == null || !item.gameObject.activeInHierarchy)
+            {
+                reason = "inactive object";
+                return false;
+            }
+
+            try
+            {
+                if (!item.Visible)
+                {
+                    reason = "hidden object";
+                    return false;
+                }
+            }
+            catch
+            {
+                reason = "visibility check failed";
+                return false;
+            }
+
+            if (!HasValidWorldTile(item))
+            {
+                reason = "no valid world tile";
+                return false;
+            }
+
+            return true;
+        }
+
+        private static bool HasValidWorldTile(CondOwner item)
+        {
+            try
+            {
+                if (item == null || item.ship == null || item.tf == null)
+                    return false;
+
+                return item.ship.GetTileAtWorldCoords1(item.tf.position.x, item.tf.position.y, true) != null;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool IsLiquidItem(CondOwner item)
+        {
+            try
+            {
+                var itemDef = item != null ? item.strItemDef : null;
+                var coDef = item != null ? item.strCODef : null;
+                return StartsWithLiquidDef(itemDef) || StartsWithLiquidDef(coDef);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool StartsWithLiquidDef(string value)
+        {
+            return !string.IsNullOrEmpty(value)
+                && value.StartsWith("ItmLiquid", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool HasInteraction(CondOwner item, string interaction)
+        {
+            return item != null
+                && item.aInteractions != null
+                && item.aInteractions.Contains(interaction);
+        }
+
+        private static bool HasAnyPickupInteraction(CondOwner item)
+        {
+            return HasInteraction(item, "PickupItemStack")
+                || HasInteraction(item, "PickupItem");
+        }
+
+        private static bool IsLooseHaulItem(CondOwner item, out string reason)
+        {
+            reason = null;
+
+            if (IsLiquidItem(item))
+            {
+                reason = "liquid contents are not safe for BIG HAUL yet";
+                return false;
+            }
+
+            if (!HasAnyPickupInteraction(item))
+            {
+                reason = "missing PickupItem/PickupItemStack";
+                return false;
+            }
+
+            if (HasAnyCond(item, "IsCumbersome", "IsOversized", "IsCrate", "IsDolly"))
+            {
+                reason = "bulky/helper item needs a carried haul helper or BIG DRAG";
+                return false;
+            }
+
+            return true;
+        }
+
+        private static bool IsHelperHaulItem(CondOwner hauler, CondOwner item, out string reason)
+        {
+            reason = null;
+
+            if (item == null)
+            {
+                reason = "null item";
+                return false;
+            }
+
+            if (IsLiquidItem(item))
+            {
+                reason = "liquid contents are not safe for BIG HAUL helper loading yet";
+                return false;
+            }
+
+            if (!HasAnyPickupInteraction(item))
+            {
+                reason = "missing PickupItem/PickupItemStack for helper loading";
+                return false;
+            }
+
+            if (HasAnyCond(item, "IsContainer", "IsCrate", "IsDolly"))
+            {
+                reason = "container/helper item is not helper cargo";
+                return false;
+            }
+
+            string fitReason;
+            if (!CanFitHaulHelper(hauler, item, out fitReason))
+            {
+                reason = fitReason;
+                return false;
+            }
+
+            return true;
+        }
+
+        internal static Interaction GetPickupInteractionForLooseItem(CondOwner item)
+        {
+            var interactionName = HasInteraction(item, "PickupItemStack")
+                ? "PickupItemStack"
+                : (HasInteraction(item, "PickupItem") ? "PickupItem" : null);
+
+            if (string.IsNullOrEmpty(interactionName))
+                return null;
+
+            return DataHandler.GetInteraction(interactionName);
+        }
+
+        internal static Interaction GetAcquireInteractionForMode(CondOwner hauler, CondOwner item, BigHaulPaintMode mode, out string reason)
+        {
+            reason = null;
+
+            if (mode == BigHaulPaintMode.Drag)
+                return GetDragStartInteraction(hauler, item, out reason);
+
+            var pickup = GetPickupInteractionForLooseItem(item);
+            if (pickup == null)
+                reason = "missing PickupItem/PickupItemStack";
+
+            return pickup;
+        }
+
+        internal static Interaction GetDragStartInteraction(CondOwner hauler, CondOwner item, out string reason)
+        {
+            reason = "no drag start interaction";
+
+            if (CanTriggerInteraction(hauler, item, "PickupDragStartNPCPledge"))
+            {
+                reason = "PickupDragStartNPCPledge";
                 return DataHandler.GetInteraction("PickupDragStartNPCPledge");
             }
 
-            if (CanTrigger(hauler, item, "PickupDragStart"))
+            if (CanTriggerInteraction(hauler, item, "PickupDragStart"))
             {
-                reason = "drag-start";
+                reason = "PickupDragStart";
                 return DataHandler.GetInteraction("PickupDragStart");
             }
 
-            reason = "no-trigger";
+            if (CanDragWorldObject(item))
+            {
+                reason = "drag slot fallback";
+                return DataHandler.GetInteraction("PickupDragStart");
+            }
+
             return null;
         }
 
-        private static void RestoreQueue(CondOwner hauler, List<Interaction> originalQueue)
-        {
-            if (hauler?.aQueue == null || originalQueue == null)
-                return;
-
-            hauler.aQueue.Clear();
-            hauler.aQueue.AddRange(originalQueue);
-        }
-
-        private static bool TryResolveActiveHelperReleaseTile(CondOwner hauler, WorkManager workManager, Task2 helperTask, CondOwner helper, HaulChain primary, DropDestinationPlanner dropPlan, out Tile tile, out string reason)
-        {
-            tile = null;
-            reason = "other";
-
-            if (helperTask != null)
-            {
-                tile = ResolveHaulDestination(hauler, helperTask, helper, dropPlan);
-                if (tile?.coProps != null)
-                {
-                    reason = "helper-task-zone";
-                    return true;
-                }
-            }
-
-            if (primary?.Walk?.objThem != null && TryGetTileFromProps(primary.Walk.objThem, out tile))
-            {
-                reason = "primary-destination";
-                return true;
-            }
-
-            reason = "no-zone";
-            return false;
-        }
-
-        private static Task2 FindHaulTaskForItem(WorkManager workManager, CondOwner item)
-        {
-            if (workManager == null || item == null || string.IsNullOrEmpty(item.strID))
-                return null;
-
-            Task2 task = null;
-            try
-            {
-                task = workManager.GetTask(item.strID, "ACTHaulItem");
-            }
-            catch
-            {
-                task = null;
-            }
-
-            if (task != null)
-                return task;
-
-            try
-            {
-                task = workManager.GetTask(item.strID, "PickupItemStack");
-            }
-            catch
-            {
-                task = null;
-            }
-
-            return task;
-        }
-
-        private static bool TryGetTileFromProps(CondOwner props, out Tile tile)
-        {
-            tile = null;
-            try
-            {
-                if (props?.ship == null)
-                    return false;
-
-                tile = props.ship.GetTileAtWorldCoords1(props.tf.position.x, props.tf.position.y, bAllowDocked: true);
-                return tile?.coProps != null;
-            }
-            catch
-            {
-                tile = null;
-                return false;
-            }
-        }
-
-        private static bool TryDeferPrimaryHaulChain(WorkManager workManager, CondOwner hauler, HaulChain primary, string reason, out string failReason)
-        {
-            failReason = "other";
-            if (workManager == null || hauler?.aQueue == null || primary?.Item == null)
-            {
-                failReason = "null";
-                return false;
-            }
-
-            if (hauler.aQueue.Count < 3)
-            {
-                failReason = "queue-too-short";
-                return false;
-            }
-
-            var task = FindActivePrimaryHaulTask(workManager, primary);
-            if (task == null)
-            {
-                failReason = "active-task-not-found";
-                return false;
-            }
-
-            task.fLastCheck = StarSystem.fEpoch;
-            task.strInteraction = "ACTHaulItem";
-            workManager.UnclaimTask(task);
-            RemoveQueuedHead(hauler, 3);
-
-            Plugin.ModInfo("[V2PrimaryDeferred] hauler=" + SafeCO(hauler)
-                + " reason=" + reason
-                + " item={" + DescribeItem(primary.Item) + "}"
-                + " queue={" + QueueSummary(hauler) + "}");
-
-            failReason = "";
-            return true;
-        }
-
-        private static Task2 FindActivePrimaryHaulTask(WorkManager workManager, HaulChain primary)
-        {
-            if (workManager == null || primary?.Item == null || string.IsNullOrEmpty(primary.Item.strID))
-                return null;
-
-            Task2 task = null;
-            try
-            {
-                task = workManager.GetTask(primary.Item.strID, "PickupItemStack");
-            }
-            catch
-            {
-                task = null;
-            }
-
-            if (IsTaskForChain(task, primary))
-                return task;
-
-            try
-            {
-                task = workManager.GetTask(primary.Item.strID, "ACTHaulItem");
-            }
-            catch
-            {
-                task = null;
-            }
-
-            return IsTaskForChain(task, primary) ? task : null;
-        }
-
-        private static bool IsTaskForChain(Task2 task, HaulChain chain)
-        {
-            if (task == null || chain?.Item == null)
-                return false;
-
-            var ia = task.GetIA();
-            return ia != null && ReferenceEquals(ia.objThem, chain.Item);
-        }
-
-        private static void RemoveQueuedHead(CondOwner hauler, int count)
-        {
-            var queue = hauler?.aQueue;
-            if (queue == null || count <= 0)
-                return;
-
-            var remove = Math.Min(count, queue.Count);
-            for (var i = 0; i < remove; i++)
-                queue.RemoveAt(0);
-        }
-
-        private static bool TryClassifyPrimary(CondOwner hauler, HaulChain primary, CarriedContainerPlan carryPlan, List<HaulChain> looseChains, ref HaulChain utilityDragChain, ref HaulChain dragChain, bool allowExtraDrag, bool allowUtilityDrag, out string stopReason)
-        {
-            stopReason = "";
-            if (primary?.Item == null)
-                return false;
-
-            if (!IsBatchableLoosePickup(hauler, primary.Item, carryPlan, out var primaryReason))
-            {
-                if (allowUtilityDrag && utilityDragChain == null && TryPlanPrimaryUtilityDragContainer(hauler, primary, carryPlan, out utilityDragChain, out var utilityReason))
-                {
-                    Plugin.ModInfo("[V2UtilityDragAdded] hauler=" + SafeCO(hauler)
-                        + " reason=" + utilityReason + "/primary-" + primaryReason
-                        + " item={" + DescribeItem(primary.Item) + "}");
-                    return true;
-                }
-
-                if (allowExtraDrag && utilityDragChain == null && dragChain == null && IsOneTripDragCandidate(hauler, primary.Item, out var dragReason))
-                {
-                    dragChain = primary;
-                    Plugin.ModInfo("[V2HaulPrimaryDrag] hauler=" + SafeCO(hauler)
-                        + " reason=" + dragReason
-                        + " item={" + DescribeItem(primary.Item) + "}");
-                    return true;
-                }
-
-                Plugin.ModInfo("[V2HaulDragPrimarySkipped] hauler=" + SafeCO(hauler)
-                    + " reason=" + (carryPlan.DragSlotOccupied ? "drag-slot-occupied" : "drag-batching-disabled") + "/primary-" + primaryReason
-                    + " carry={" + carryPlan.Description + "}"
-                    + " item={" + DescribeItem(primary.Item) + "}");
-
-                Plugin.ModInfo("[V2HaulVanillaPrimary] hauler=" + SafeCO(hauler)
-                    + " reason=" + primaryReason
-                    + " item={" + DescribeItem(primary.Item) + "}");
-                stopReason = primaryReason;
-                return false;
-            }
-
-            if (carryPlan.TryReserve(primary.Item, out var primaryReserveReason))
-            {
-                looseChains.Add(primary);
-                return true;
-            }
-
-            if (allowUtilityDrag && utilityDragChain == null && IsDragReserveStop(primaryReserveReason) && TryPlanPrimaryUtilityDragContainer(hauler, primary, carryPlan, out utilityDragChain, out var reserveUtilityReason))
-            {
-                Plugin.ModInfo("[V2UtilityDragAdded] hauler=" + SafeCO(hauler)
-                    + " reason=" + reserveUtilityReason + "/primary-" + primaryReserveReason
-                    + " item={" + DescribeItem(primary.Item) + "}");
-                return true;
-            }
-
-            if (allowExtraDrag && utilityDragChain == null && IsDragReserveStop(primaryReserveReason) && dragChain == null && IsOneTripDragCandidate(hauler, primary.Item, out var reserveDragReason))
-            {
-                dragChain = primary;
-                Plugin.ModInfo("[V2HaulPrimaryDrag] hauler=" + SafeCO(hauler)
-                    + " reason=" + reserveDragReason + "/" + primaryReserveReason
-                    + " item={" + DescribeItem(primary.Item) + "}");
-                return true;
-            }
-
-            Plugin.ModInfo("[V2HaulPrimaryNoRoom] hauler=" + SafeCO(hauler)
-                + " reason=" + primaryReserveReason
-                + " carry={" + carryPlan.Description + "}"
-                + " item={" + DescribeItem(primary.Item) + "}");
-            stopReason = primaryReserveReason;
-            return false;
-        }
-
-        private static bool TryPlanPrimaryUtilityDragContainer(CondOwner hauler, HaulChain primary, CarriedContainerPlan carryPlan, out HaulChain chain, out string reason)
-        {
-            chain = null;
-            reason = "other";
-
-            if (primary?.Item == null)
-            {
-                reason = "null";
-                return false;
-            }
-
-            if (!IsUtilityDragContainerCandidate(hauler, primary.Item, out reason))
-                return false;
-
-            if (!carryPlan.TryAddPlannedContainer(primary.Item, "planned-primary-drag", out var addReason))
-            {
-                reason = "container-plan-" + addReason;
-                return false;
-            }
-
-            chain = primary;
-            reason = "planned-primary-drag-container";
-            return true;
-        }
-
-        private static bool TryReadClaimedHaulTask(CondOwner hauler, Task2 task, DropDestinationPlanner dropPlan, out CondOwner item, out Tile tile, out string reason)
-        {
-            item = null;
-            tile = null;
-            reason = "other";
-
-            if (hauler == null || task == null)
-            {
-                reason = "null";
-                return false;
-            }
-
-            if (!IsHaulTask(task))
-            {
-                reason = "not-haul-task";
-                return false;
-            }
-
-            item = task.GetIA()?.objThem;
-            if (item == null)
-            {
-                reason = "no-item";
-                return false;
-            }
-
-            if (!WorkManager.CTHaul.Triggered(item))
-            {
-                reason = "not-haulable";
-                return false;
-            }
-
-            tile = ResolveHaulDestination(hauler, task, item, dropPlan);
-            if (tile?.coProps == null || string.IsNullOrEmpty(task.strTileShip))
-            {
-                reason = "no-destination";
-                return false;
-            }
-
-            reason = "";
-            return true;
-        }
-
-        private static bool TryQueueVanillaHaulChain(CondOwner hauler, Task2 task, CondOwner item, Tile tile, out HaulChain chain, out string reason)
-        {
-            chain = null;
-            reason = "other";
-
-            var pickup = DataHandler.GetInteraction("PickupItemStack");
-            var walk = DataHandler.GetInteraction("Walk");
-            var drop = DataHandler.GetInteraction("DropItemStack");
-            if (pickup == null || walk == null || drop == null)
-            {
-                reason = "missing-interaction";
-                return false;
-            }
-
-            if (!hauler.QueueInteraction(item, pickup))
-            {
-                reason = "pickup-queue-failed";
-                return false;
-            }
-
-            task.strInteraction = pickup.strName;
-
-            walk.strTargetPoint = "use";
-            walk.fTargetPointRange = 0f;
-            if (!hauler.QueueInteraction(tile.coProps, walk))
-            {
-                reason = "walk-queue-failed";
-                return false;
-            }
-
-            if (!hauler.QueueInteraction(item, drop))
-            {
-                reason = "drop-queue-failed";
-                return false;
-            }
-
-            task.SetIA(drop);
-            chain = new HaulChain(item, pickup, walk, drop);
-            reason = "";
-            return true;
-        }
-
-        private static bool TryPlanUtilityDragContainer(CondOwner hauler, Task2 task, CondOwner item, Tile tile, CarriedContainerPlan carryPlan, out HaulChain chain, out string reason)
-        {
-            chain = null;
-            reason = "other";
-
-            if (!IsUtilityDragContainerCandidate(hauler, item, out reason))
-                return false;
-
-            var queueCount = hauler?.aQueue?.Count ?? 0;
-            if (!TryQueueUtilityDragChain(hauler, task, item, tile, out chain, out var queueReason))
-            {
-                RemoveQueuedTail(hauler, queueCount);
-                reason = "queue-" + queueReason;
-                return false;
-            }
-
-            if (!carryPlan.TryAddPlannedContainer(item, "planned-drag", out var addReason))
-            {
-                RemoveQueuedTail(hauler, queueCount);
-                chain = null;
-                reason = "container-plan-" + addReason;
-                return false;
-            }
-
-            reason = "planned-drag-container";
-            return true;
-        }
-
-        private static bool TryQueueUtilityDragChain(CondOwner hauler, Task2 task, CondOwner item, Tile tile, out HaulChain chain, out string reason)
-        {
-            return TryQueueVanillaHaulChain(hauler, task, item, tile, out chain, out reason);
-        }
-
-        private static void RemoveQueuedTail(CondOwner hauler, int queueCount)
-        {
-            var queue = hauler?.aQueue;
-            if (queue == null)
-                return;
-
-            while (queue.Count > queueCount)
-                queue.RemoveAt(queue.Count - 1);
-        }
-
-        private static bool IsLooseInventoryPickup(CondOwner hauler, CondOwner item, out string reason)
-        {
-            reason = "other";
-            if (hauler == null || item == null)
-            {
-                reason = "null";
-                return false;
-            }
-
-            if (item.bDestroyed)
-            {
-                reason = "destroyed";
-                return false;
-            }
-
-            if (item.coStackHead != null)
-            {
-                reason = "stack-child";
-                return false;
-            }
-
-            if (item.objCOParent != null || item.slotNow != null || item.HasCond("IsCarried") || item.HasCond("IsInstalled"))
-            {
-                reason = "not-loose";
-                return false;
-            }
-
-            if (item.Item == null)
-            {
-                reason = "not-item";
-                return false;
-            }
-
-            if (!CanTrigger(hauler, item, "PickupItemStack"))
-            {
-                reason = CanTrigger(hauler, item, "PickupDragStart") ? "drag-only" : "no-pickup-stack";
-                return false;
-            }
-
-            reason = "";
-            return true;
-        }
-
-        private static bool IsBatchableLoosePickup(CondOwner hauler, CondOwner item, CarriedContainerPlan carryPlan, out string reason)
-        {
-            if (!IsLooseInventoryPickup(hauler, item, out reason))
-                return false;
-
-            if (carryPlan == null || !carryPlan.HasActiveDragContainer)
-                return true;
-
-            if (IsUnsafeActiveHelperLoosePickup(item, carryPlan, out reason))
-                return false;
-
-            reason = "";
-            return true;
-        }
-
-        private static bool IsUnsafeActiveHelperLoosePickup(CondOwner item, CarriedContainerPlan carryPlan, out string reason)
-        {
-            reason = "";
-            if (item == null)
-            {
-                reason = "active-helper-null";
-                return true;
-            }
-
-            if (carryPlan != null && carryPlan.IsActiveDragContainer(item))
-            {
-                reason = "active-helper-self";
-                return true;
-            }
-
-            if (item.objContainer != null)
-            {
-                reason = "active-helper-container";
-                return true;
-            }
-
-            return false;
-        }
-
-        private static bool IsUtilityDragContainerCandidate(CondOwner hauler, CondOwner item, out string reason)
-        {
-            reason = "other";
-            if (hauler == null || item == null)
-            {
-                reason = "null";
-                return false;
-            }
-
-            if (GetDragSlotItem(hauler) != null || hauler.HasCond("IsDragging"))
-            {
-                reason = "drag-slot-occupied";
-                return false;
-            }
-
-            if (item.bDestroyed)
-            {
-                reason = "destroyed";
-                return false;
-            }
-
-            if (item.coStackHead != null)
-            {
-                reason = "stack-child";
-                return false;
-            }
-
-            if (item.objCOParent != null || item.slotNow != null || item.HasCond("IsCarried") || item.HasCond("IsInstalled"))
-            {
-                reason = "not-loose";
-                return false;
-            }
-
-            if (item.Item == null)
-            {
-                reason = "not-item";
-                return false;
-            }
-
-            if (item.objContainer == null)
-            {
-                reason = "no-container";
-                return false;
-            }
-
-            if (item.objContainer.gridLayout == null && !item.HasCond("IsInfiniteContainer"))
-            {
-                reason = "no-container-grid";
-                return false;
-            }
-
-            var canDragAsHelper = HasDragSlot(item)
-                || CanTrigger(hauler, item, "PickupDragStartNPCPledge")
-                || CanTrigger(hauler, item, "PickupDragStart");
-            if (!canDragAsHelper)
-            {
-                reason = "not-drag-helper";
-                return false;
-            }
-
-            var containerCells = ContainerGridCellCount(item);
-            if (containerCells > 0 && containerCells < 9)
-            {
-                reason = "container-grid-too-small-" + containerCells;
-                return false;
-            }
-
-            reason = "";
-            return true;
-        }
-
-        private static int ContainerGridCellCount(CondOwner item)
-        {
-            try
-            {
-                if (item?.objContainer?.gridLayout != null)
-                    return Math.Max(0, item.objContainer.gridLayout.gridMaxX * item.objContainer.gridLayout.gridMaxY);
-
-                if (item?.HasCond("IsInfiniteContainer") ?? false)
-                    return int.MaxValue;
-            }
-            catch
-            {
-            }
-
-            return 0;
-        }
-
-        private static bool IsOneTripDragCandidate(CondOwner hauler, CondOwner item, out string reason)
-        {
-            reason = "other";
-            if (hauler == null || item == null)
-            {
-                reason = "null";
-                return false;
-            }
-
-            if (GetDragSlotItem(hauler) != null || hauler.HasCond("IsDragging"))
-            {
-                reason = "drag-slot-occupied";
-                return false;
-            }
-
-            if (item.bDestroyed)
-            {
-                reason = "destroyed";
-                return false;
-            }
-
-            if (item.coStackHead != null)
-            {
-                reason = "stack-child";
-                return false;
-            }
-
-            if (item.objCOParent != null || item.slotNow != null || item.HasCond("IsCarried") || item.HasCond("IsInstalled"))
-            {
-                reason = "not-loose";
-                return false;
-            }
-
-            if (item.Item == null)
-            {
-                reason = "not-item";
-                return false;
-            }
-
-            if (!CanTrigger(hauler, item, "PickupItemStack"))
-            {
-                reason = "no-pickup-stack";
-                return false;
-            }
-
-            if (IsStackableInventoryItem(item))
-            {
-                reason = "stackable-inventory";
-                return false;
-            }
-
-            if (CanTrigger(hauler, item, "PickupDragStart"))
-            {
-                reason = "dragstart";
-                return true;
-            }
-
-            if (HasDragSlot(item))
-            {
-                reason = "dragslot";
-                return true;
-            }
-
-            reason = "no-drag-marker";
-            return false;
-        }
-
-        private static bool IsDragReserveStop(string reason)
-        {
-            return reason == "container-reject" || reason == "too-large";
-        }
-
-        private static bool IsStackableInventoryItem(CondOwner item)
-        {
-            try
-            {
-                if (item == null || item.Item == null)
-                    return false;
-
-                if (item.nStackLimit <= 1)
-                    return false;
-
-                if (item.objContainer != null)
-                    return false;
-
-                if (item.HasCond("IsCumbersome") || item.HasCond("IsOversized"))
-                    return false;
-
-                return true;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        private static bool HasDragSlot(CondOwner item)
-        {
-            try
-            {
-                return item?.mapSlotEffects != null && item.mapSlotEffects.ContainsKey("drag");
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        internal static CondOwner GetDragSlotItem(CondOwner hauler)
-        {
-            try
-            {
-                return hauler?.compSlots?.GetSlot("drag")?.GetOutermostCO();
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        private static bool CanTrigger(CondOwner hauler, CondOwner item, string interactionName)
+        private static bool CanTriggerInteraction(CondOwner hauler, CondOwner item, string interactionName)
         {
             var interaction = DataHandler.GetInteraction(interactionName);
             if (interaction == null)
@@ -1717,176 +1817,2319 @@ namespace OstranautsHaulingV2
             }
         }
 
-        private static Tile ResolveHaulDestination(CondOwner hauler, Task2 task, CondOwner item, DropDestinationPlanner dropPlan)
+        internal static Interaction GetStopDragInteraction()
         {
-            if (hauler == null || task == null || item == null)
-                return null;
-
-            if (dropPlan != null && dropPlan.TryResolveForTask(task, item, out var plannedTile, out var planReason))
-            {
-                Plugin.ModInfo("[V2DropPlan] hauler=" + SafeCO(hauler)
-                    + " reason=" + planReason
-                    + " dest=" + DescribeTile(plannedTile)
-                    + " item={" + DescribeItem(item) + "}");
-                return plannedTile;
-            }
-
-            Tile tile = null;
-            Ship targetShip = null;
-            CrewSim.system.dictShips.TryGetValue(task.strTileShip, out targetShip);
-
-            if (targetShip != null)
-            {
-                if (task.nTile >= 0 && targetShip.aTiles.Count > task.nTile)
-                {
-                    tile = targetShip.aTiles[task.nTile];
-                }
-                else if (CrewSim.objInstance?.workManager?.HaulZone(hauler, task, item) != null)
-                {
-                    CrewSim.system.dictShips.TryGetValue(task.strTileShip, out targetShip);
-                    if (targetShip != null && task.nTile >= 0 && targetShip.aTiles.Count > task.nTile)
-                        tile = targetShip.aTiles[task.nTile];
-                }
-            }
-
-            if (tile != null)
-            {
-                Plugin.ModInfo("[V2DropPlan] hauler=" + SafeCO(hauler)
-                    + " reason=vanilla-fallback"
-                    + " dest=" + DescribeTile(tile)
-                    + " item={" + DescribeItem(item) + "}");
-            }
-
-            return tile;
+            return DataHandler.GetInteraction("PickupDragStop");
         }
 
-        private static void SortPickupChainsNearestNeighbor(CondOwner hauler, List<HaulChain> chains)
+        internal static bool CanFitHaulHelper(CondOwner hauler, CondOwner item, out string reason)
         {
-            if (hauler == null || chains == null || chains.Count <= 1)
-                return;
+            reason = "no carried haul helper can fit item";
 
-            var currentTile = GetCurrentTile(hauler);
-            var remaining = new List<PickupSortTarget>();
-            for (var i = 0; i < chains.Count; i++)
+            if (hauler == null || item == null)
             {
-                remaining.Add(new PickupSortTarget
-                {
-                    Chain = chains[i],
-                    Tile = GetPickupTile(hauler, chains[i]),
-                    OriginalIndex = i
-                });
+                reason = "missing hauler or item for helper fit";
+                return false;
             }
 
-            var orderedTargets = new List<PickupSortTarget>(chains.Count);
-            var usedPathScores = 0;
-            var usedFallbackScores = 0;
-
-            while (remaining.Count > 0)
+            var carriers = GetHaulHelpers(hauler).ToList();
+            if (carriers.Count == 0)
             {
-                var bestIndex = 0;
-                PickupSortScore bestScore = null;
+                reason = "no carried crate/dolly helper";
+                return false;
+            }
 
-                for (var i = 0; i < remaining.Count; i++)
+            foreach (var carrier in carriers)
+            {
+                try
                 {
-                    var score = ScorePickupTarget(hauler, currentTile, remaining[i]);
-                    if (score.UsedPath)
-                        usedPathScores++;
-                    else
-                        usedFallbackScores++;
-
-                    if (bestScore == null || IsBetterPickupScore(score, bestScore))
+                    if (carrier != null && carrier.objContainer != null && carrier.objContainer.CanFit(item, false, false))
                     {
-                        bestScore = score;
-                        bestIndex = i;
+                        reason = "fits carried helper " + SafeName(carrier);
+                        return true;
+                    }
+                }
+                catch
+                {
+                    // Try the next carried helper.
+                }
+            }
+
+            reason = "carried haul helpers cannot fit item";
+            return false;
+        }
+
+        internal static IEnumerable<CondOwner> GetHaulHelpersForHauler(CondOwner hauler)
+        {
+            try
+            {
+                return GetHaulHelpers(hauler).ToList();
+            }
+            catch
+            {
+                return Enumerable.Empty<CondOwner>();
+            }
+        }
+
+        internal static IEnumerable<CondOwner> GetDirectHaulHelperCargo(CondOwner helper)
+        {
+            var cargo = new List<CondOwner>();
+
+            try
+            {
+                if (!IsHaulHelper(helper))
+                    return cargo;
+
+                var seen = new HashSet<string>();
+                foreach (var candidate in helper.GetCOsSafe(true))
+                {
+                    var head = candidate != null && candidate.coStackHead != null ? candidate.coStackHead : candidate;
+                    if (head == null || head.bDestroyed || head == helper)
+                        continue;
+
+                    if (!IsDirectCargoOfHelper(head, helper))
+                        continue;
+
+                    string reason;
+                    if (!IsDrainableHaulHelperCargo(head, out reason))
+                        continue;
+
+                    var id = SafeValue(() => head.strID);
+                    if (!string.IsNullOrEmpty(id) && id != "<null>" && !seen.Add(id))
+                        continue;
+
+                    cargo.Add(head);
+                }
+            }
+            catch (Exception ex)
+            {
+                Warn("[BIGHelperCargo] failed: helper=" + SafeName(helper) + " error=" + ex.Message);
+            }
+
+            return cargo;
+        }
+
+        internal static bool IsInventoryDeltaHaulCargo(CondOwner item, out string reason)
+        {
+            if (!IsDrainableHaulHelperCargo(item, out reason))
+                return false;
+
+            if (HasAnyCond(item, "IsContainer", "IsCrate", "IsDolly"))
+            {
+                reason = "container/helper cargo blocked";
+                return false;
+            }
+
+            return true;
+        }
+
+        private static IEnumerable<CondOwner> GetHaulHelpers(CondOwner hauler)
+        {
+            var seen = new HashSet<string>();
+            foreach (var candidate in GetPotentialCarriedContainers(hauler))
+            {
+                if (!IsHaulHelper(candidate))
+                    continue;
+
+                var id = SafeValue(() => candidate.strID);
+                if (!string.IsNullOrEmpty(id) && id != "<null>" && !seen.Add(id))
+                    continue;
+
+                yield return candidate;
+            }
+        }
+
+        private static IEnumerable<CondOwner> GetPotentialCarriedContainers(CondOwner hauler)
+        {
+            var result = new List<CondOwner>();
+            if (hauler == null)
+                return result;
+
+            CondOwner dragItem = null;
+            try
+            {
+                dragItem = hauler.compSlots?.GetSlot("drag")?.GetOutermostCO();
+            }
+            catch
+            {
+                dragItem = null;
+            }
+
+            if (dragItem != null)
+                result.Add(dragItem);
+
+            try
+            {
+                if (hauler.compSlots != null)
+                {
+                    foreach (var slot in hauler.compSlots.GetSlotsHeldFirst(true))
+                    {
+                        var item = slot?.GetOutermostCO();
+                        if (item != null)
+                            result.Add(item);
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            IEnumerable<CondOwner> carried = null;
+            try
+            {
+                carried = hauler.GetCOsSafe(true);
+            }
+            catch
+            {
+                carried = null;
+            }
+
+            if (carried == null)
+                return result;
+
+            foreach (var item in carried)
+            {
+                if (item != null)
+                    result.Add(item);
+            }
+
+            return result;
+        }
+
+        private static bool IsHaulHelper(CondOwner item)
+        {
+            try
+            {
+                if (item == null || item.objContainer == null || item.bDestroyed)
+                    return false;
+
+                if (HasAnyCond(item, "IsInstalled", "IsSystem"))
+                    return false;
+
+                if (item.objContainer.gridLayout == null && !HasAnyCond(item, "IsInfiniteContainer"))
+                    return false;
+
+                return HasAnyCond(item, "IsDolly", "IsCrate");
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool IsDirectCargoOfHelper(CondOwner item, CondOwner helper)
+        {
+            try
+            {
+                if (item == null || helper == null)
+                    return false;
+
+                var parent = item.objCOParent;
+                return parent == helper || SafeValue(() => parent != null ? parent.strID : null) == SafeValue(() => helper.strID);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool IsDrainableHaulHelperCargo(CondOwner item, out string reason)
+        {
+            reason = null;
+
+            if (item == null)
+            {
+                reason = "null cargo";
+                return false;
+            }
+
+            if (item.bDestroyed)
+            {
+                reason = "destroyed cargo";
+                return false;
+            }
+
+            if (IsLiquidItem(item))
+            {
+                reason = "liquid cargo blocked";
+                return false;
+            }
+
+            if (HasAnyCond(item, "IsInstalled", "IsSystem", "IsHuman", "IsRobot"))
+            {
+                reason = "installed/system/person cargo blocked";
+                return false;
+            }
+
+            if (HasAnyCond(item, "IsCrate", "IsDolly"))
+            {
+                reason = "nested haul helper blocked";
+                return false;
+            }
+
+            return true;
+        }
+
+        private static bool CanDragWorldObject(CondOwner item)
+        {
+            return HasInteraction(item, "PickupDragStart")
+                || HasInteraction(item, "PickupDragStartNPCPledge")
+                || HasDragSlot(item);
+        }
+
+        private static bool HasDragSlot(CondOwner item)
+        {
+            try
+            {
+                return item != null
+                    && item.mapSlotEffects != null
+                    && item.mapSlotEffects.ContainsKey("drag");
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool TriggerCond(CondOwner item, string triggerName)
+        {
+            try
+            {
+                var trigger = DataHandler.GetCondTrigger(triggerName);
+                return trigger != null && trigger.Triggered(item, null, false);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static string ModeLabel(BigHaulPaintMode mode)
+        {
+            switch (mode)
+            {
+                case BigHaulPaintMode.Haul:
+                    return "haul";
+                case BigHaulPaintMode.Drag:
+                    return "drag";
+                default:
+                    return "unknown";
+            }
+        }
+
+        private static bool HasAnyCond(CondOwner co, params string[] conds)
+        {
+            foreach (var cond in conds)
+            {
+                try
+                {
+                    if (co.HasCond(cond))
+                        return true;
+                }
+                catch
+                {
+                    // Some transient objects can fail condition checks during load/unload.
+                }
+            }
+
+            return false;
+        }
+
+        internal static bool IsDataReady()
+        {
+            try
+            {
+                return DataHandler.bInitialised
+                    && DataHandler.dictInteractions != null
+                    && DataHandler.dictInteractions.ContainsKey("PickupItemStack")
+                    && DataHandler.dictInteractions.ContainsKey("PickupItem");
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        internal static string Describe(CondOwner co)
+        {
+            if (co == null)
+                return "<null>";
+
+            return SafeName(co)
+                + " id=" + SafeValue(() => co.strID)
+                + " def=" + SafeValue(() => co.strItemDef)
+                + " ship=" + SafeValue(() => co.ship != null ? co.ship.strRegID : "<no ship>")
+                + " tile=" + SafeTile(co);
+        }
+
+        internal static string SafeName(CondOwner co)
+        {
+            if (co == null)
+                return "<null>";
+
+            return SafeValue(() =>
+            {
+                if (!string.IsNullOrEmpty(co.strNameFriendly))
+                    return co.strNameFriendly;
+                if (!string.IsNullOrEmpty(co.strNameShort))
+                    return co.strNameShort;
+                return co.strName ?? "<unnamed>";
+            });
+        }
+
+        internal static string SafeTile(CondOwner co)
+        {
+            try
+            {
+                if (co?.ship == null || co.tf == null)
+                    return "<none>";
+
+                var tile = co.ship.GetTileAtWorldCoords1(co.tf.position.x, co.tf.position.y, true);
+                return tile != null ? tile.Index.ToString() : "<none>";
+            }
+            catch
+            {
+                return "<error>";
+            }
+        }
+
+        private static string SafeValue(Func<string> getter)
+        {
+            try
+            {
+                return getter() ?? "<null>";
+            }
+            catch
+            {
+                return "<error>";
+            }
+        }
+
+        internal static void ModInfo(string message)
+        {
+            Log?.LogInfo(message);
+            BigLog.Write("INFO", message);
+        }
+
+        internal static void Warn(string message)
+        {
+            Log?.LogWarning(message);
+            BigLog.Write("WARN", message);
+        }
+
+        internal static void Error(string message)
+        {
+            Log?.LogError(message);
+            BigLog.Write("ERROR", message);
+        }
+    }
+
+    internal static class BigHaulPlanner
+    {
+        private const int MaxSessionItems = 200;
+        private const float OffShipPickupPenalty = 1000000f;
+        private static readonly Dictionary<string, BigLooseHaulSession> ActiveSessions = new Dictionary<string, BigLooseHaulSession>();
+
+        internal static void CancelAllForHauler(CondOwner hauler, string reason, bool clearQueue)
+        {
+            if (hauler == null)
+                return;
+
+            CancelSession(hauler, reason, clearQueue);
+        }
+
+        internal static int StartDragSession(CondOwner hauler, IEnumerable<CondOwner> items)
+        {
+            return StartModeSession(hauler, BigHaulPaintMode.Drag, items);
+        }
+
+        private static string ModeMarker(BigHaulPaintMode mode, string suffix)
+        {
+            switch (mode)
+            {
+                case BigHaulPaintMode.Haul:
+                    return "BIG" + suffix;
+                case BigHaulPaintMode.Drag:
+                    return "BIGDrag" + suffix;
+                default:
+                    return "BIGMode" + suffix;
+            }
+        }
+
+        internal static int StartLooseSession(CondOwner hauler, IEnumerable<CondOwner> items)
+        {
+            return StartModeSession(hauler, BigHaulPaintMode.Haul, items);
+        }
+
+        private static int StartModeSession(CondOwner hauler, BigHaulPaintMode mode, IEnumerable<CondOwner> items)
+        {
+            if (hauler == null)
+            {
+                Plugin.Warn("[" + ModeMarker(mode, "PlanStart") + "] skipped: hauler was null.");
+                return 0;
+            }
+
+            var haulerId = SafeId(hauler);
+            if (string.IsNullOrEmpty(haulerId))
+            {
+                Plugin.Warn("[" + ModeMarker(mode, "PlanStart") + "] skipped: hauler had no id.");
+                return 0;
+            }
+
+            var selected = new List<CondOwner>();
+            var seen = new HashSet<string>();
+
+            foreach (var item in items ?? Enumerable.Empty<CondOwner>())
+            {
+                if (!IsValidPendingItem(hauler, item, mode))
+                    continue;
+
+                var id = SafeId(item);
+                if (string.IsNullOrEmpty(id) || !seen.Add(id))
+                    continue;
+
+                selected.Add(item);
+            }
+
+            var scored = new List<Tuple<CondOwner, float>>();
+            var skippedNoPath = 0;
+            foreach (var item in selected)
+            {
+                var pickup = Plugin.GetAcquireInteractionForMode(hauler, item, mode, out var pickupReason);
+                if (pickup == null)
+                {
+                    skippedNoPath++;
+                    BigHaulRegistry.MarkState(item, "SkippedNoPath", "acquire interaction missing before planning: " + pickupReason);
+                    continue;
+                }
+
+                pickup.bManual = true;
+
+                var score = PickupSortScore(hauler, item, pickup);
+                if (score >= float.MaxValue * 0.5f)
+                {
+                    skippedNoPath++;
+                    BigHaulRegistry.MarkState(item, "SkippedNoPath", "no reachable path before planning");
+                    continue;
+                }
+
+                scored.Add(new Tuple<CondOwner, float>(item, score));
+            }
+
+            var plannedItems = scored
+                .OrderBy(item => item.Item2)
+                .Select(item => item.Item1)
+                .ToList();
+
+            selected = plannedItems
+                .Take(MaxSessionItems)
+                .ToList();
+
+            var backlog = plannedItems
+                .Skip(MaxSessionItems)
+                .ToList();
+
+            if (skippedNoPath > 0)
+                Plugin.Warn("[" + ModeMarker(mode, "PlanFilter") + "] hauler=" + Plugin.SafeName(hauler) + " skippedNoPath=" + skippedNoPath + " planned=" + selected.Count + " backlog=" + backlog.Count + ".");
+
+            if (selected.Count == 0)
+            {
+                Plugin.Warn("[" + ModeMarker(mode, "PlanStart") + "] skipped: no valid items survived filtering.");
+                return 0;
+            }
+
+            BigLooseHaulSession existing;
+            if (ActiveSessions.TryGetValue(haulerId, out existing) && existing != null)
+                return MergeLooseSession(hauler, existing, selected.Concat(backlog).ToList(), mode);
+
+            SafeClearQueue(hauler, "start " + mode + " BIG session");
+
+            var session = new BigLooseHaulSession
+            {
+                HaulerId = haulerId,
+                HaulerName = Plugin.SafeName(hauler),
+                Mode = mode,
+                Pending = selected,
+                Backlog = backlog,
+                StartedAt = DateTime.Now
+            };
+
+            TrackSessionCargoKeys(session, session.Pending);
+            TrackSessionCargoKeys(session, session.Backlog);
+            CaptureInventoryBaseline(hauler, session, "start");
+
+            ActiveSessions[haulerId] = session;
+            Plugin.ModInfo("[" + ModeMarker(mode, "PlanStart") + "] hauler=" + session.HaulerName + " pending=" + session.Pending.Count + " backlog=" + session.Backlog.Count + " queue=" + Plugin.QueueSummary(hauler) + ".");
+            var planned = session.Pending.Count + session.Backlog.Count;
+
+            if (!IsAutoTaskingEnabled(hauler))
+            {
+                session.AutoPausedLogged = true;
+                Plugin.Warn("[" + ModeMarker(mode, "PlanPaused") + "] hauler=" + session.HaulerName + " reason=auto-tasking-disabled pending=" + session.Pending.Count + " backlog=" + session.Backlog.Count + ".");
+                return planned;
+            }
+
+            TryPump(hauler);
+            return planned;
+        }
+
+        private static int MergeLooseSession(CondOwner hauler, BigLooseHaulSession session, List<CondOwner> plannedItems, BigHaulPaintMode mode)
+        {
+            if (hauler == null || session == null || plannedItems == null || plannedItems.Count == 0)
+                return 0;
+
+            PruneSession(hauler, session);
+
+            var addedPending = 0;
+            var addedBacklog = 0;
+            var duplicates = 0;
+
+            foreach (var item in plannedItems)
+            {
+                if (!IsValidPendingItem(hauler, item, mode))
+                    continue;
+
+                if (SessionContainsItem(session, item))
+                {
+                    duplicates++;
+                    continue;
+                }
+
+                if (!session.DropPhase && session.Pending.Count < MaxSessionItems)
+                {
+                    session.Pending.Add(item);
+                    TrackSessionCargoKey(session, item);
+                    addedPending++;
+                }
+                else
+                {
+                    session.Backlog.Add(item);
+                    TrackSessionCargoKey(session, item);
+                    addedBacklog++;
+                }
+            }
+
+            var added = addedPending + addedBacklog;
+            Plugin.ModInfo("[" + ModeMarker(mode, "PlanMerge") + "] hauler=" + session.HaulerName
+                + " addedPending=" + addedPending
+                + " addedBacklog=" + addedBacklog
+                + " duplicates=" + duplicates
+                + " pending=" + session.Pending.Count
+                + " backlog=" + session.Backlog.Count
+                + " carried=" + session.Carried.Count
+                + " queue=" + Plugin.QueueSummary(hauler) + ".");
+
+            if (added <= 0)
+                return 0;
+
+            if (!IsAutoTaskingEnabled(hauler))
+            {
+                if (!session.AutoPausedLogged)
+                {
+                    session.AutoPausedLogged = true;
+                    Plugin.Warn("[" + ModeMarker(mode, "PlanPaused") + "] hauler=" + session.HaulerName + " reason=auto-tasking-disabled pending=" + session.Pending.Count + " backlog=" + session.Backlog.Count + ".");
+                }
+
+                return added;
+            }
+
+            TryPump(hauler);
+            return added;
+        }
+
+        private static bool SessionContainsItem(BigLooseHaulSession session, CondOwner item)
+        {
+            if (session == null || item == null)
+                return false;
+
+            var id = SafeId(item);
+            if (string.IsNullOrEmpty(id))
+                return false;
+
+            if (ContainsSame(session.Pending, item) || ContainsSame(session.Backlog, item) || ContainsSame(session.Carried, item))
+                return true;
+
+            if (session.CurrentPickup != null && SafeId(session.CurrentPickup) == id)
+                return true;
+
+            return session.CurrentDrop != null && session.CurrentDrop.Item != null && SafeId(session.CurrentDrop.Item) == id;
+        }
+
+        internal static void PumpSelectedCrew()
+        {
+            try
+            {
+                TryPump(CrewSim.GetSelectedCrew());
+            }
+            catch (Exception ex)
+            {
+                Plugin.Warn("[BIGPumpSelected] failed: " + ex.Message);
+            }
+        }
+
+        internal static void TryPump(CondOwner hauler)
+        {
+            if (hauler == null)
+                return;
+
+            BigLooseHaulSession session;
+            if (!ActiveSessions.TryGetValue(SafeId(hauler), out session))
+                return;
+
+                if (!IsAutoTaskingEnabled(hauler))
+                {
+                    if (!session.AutoPausedLogged)
+                    {
+                        session.AutoPausedLogged = true;
+                        Plugin.Warn("[" + ModeMarker(session.Mode, "PlanPaused") + "] hauler=" + Plugin.SafeName(hauler) + " reason=auto-tasking-disabled pending=" + session.Pending.Count + " backlog=" + session.Backlog.Count + " carried=" + session.Carried.Count + ".");
+                    }
+
+                    return;
+            }
+
+            session.AutoPausedLogged = false;
+
+            if (hauler.aQueue != null && hauler.aQueue.Count > 0)
+                return;
+
+            for (var guard = 0; guard < 16; guard++)
+            {
+                if (session.CurrentPickup != null)
+                {
+                    FinishPickup(hauler, session);
+                    continue;
+                }
+
+                if (session.CurrentDrop != null)
+                {
+                    FinishDrop(hauler, session);
+                    continue;
+                }
+
+                PruneSession(hauler, session);
+                SyncCarriedFromHauler(hauler, session, "pump");
+                SyncExistingDragSlotForDragSession(hauler, session, "pump");
+
+                if (session.Pending.Count == 0)
+                {
+                    if (LoadNextBatch(hauler, session))
+                        continue;
+
+                    if (session.Carried.Count > 0)
+                    {
+                        session.DropPhase = true;
+                        QueueNextDrop(hauler, session);
+                        return;
+                    }
+
+                    CompleteSession(hauler, session, "all items handled");
+                    return;
+                }
+
+                if (session.DropPhase && session.Carried.Count > 0)
+                {
+                    QueueNextDrop(hauler, session);
+                    return;
+                }
+
+                if (session.Carried.Count > 0 && !HasAnyFittablePending(hauler, session))
+                {
+                    session.DropPhase = true;
+                    QueueNextDrop(hauler, session);
+                    return;
+                }
+
+                var next = FindNearestFittablePending(hauler, session);
+                if (next != null)
+                {
+                    QueuePickup(hauler, session, next);
+                    return;
+                }
+
+                if (session.Pending.Count == 0)
+                {
+                    if (LoadNextBatch(hauler, session))
+                        continue;
+
+                    if (session.Carried.Count > 0)
+                    {
+                        session.DropPhase = true;
+                        QueueNextDrop(hauler, session);
+                        return;
+                    }
+
+                    CompleteSession(hauler, session, "no reachable pending items");
+                    return;
+                }
+
+                if (session.Carried.Count > 0)
+                {
+                    session.DropPhase = true;
+                    QueueNextDrop(hauler, session);
+                    return;
+                }
+
+                var skipped = session.Pending[0];
+                session.Pending.RemoveAt(0);
+                BigHaulRegistry.MarkState(skipped, "SkippedNoRoom", "no inventory slot before pickup");
+                Plugin.Warn("[BIGSkipNoRoom] hauler=" + Plugin.SafeName(hauler) + " item=" + Plugin.Describe(skipped) + " pending=" + session.Pending.Count + " backlog=" + session.Backlog.Count + ".");
+            }
+
+            Plugin.Warn("[BIGPumpGuard] stopped after guard limit. hauler=" + Plugin.SafeName(hauler) + " pending=" + session.Pending.Count + " backlog=" + session.Backlog.Count + " carried=" + session.Carried.Count + ".");
+        }
+
+        private static void SyncExistingDragSlotForDragSession(CondOwner hauler, BigLooseHaulSession session, string reason)
+        {
+            if (session == null || session.Mode != BigHaulPaintMode.Drag)
+                return;
+
+            var dragged = GetDragSlotItem(hauler);
+            if (dragged == null || dragged.bDestroyed)
+                return;
+
+            var head = StackHead(dragged);
+            if (head == null || head.bDestroyed || ContainsSame(session.Carried, head))
+                return;
+
+            session.Carried.Add(head);
+            Plugin.ModInfo("[BIGDragCarrySync] hauler=" + Plugin.SafeName(hauler) + " reason=" + reason + " existingDrag=" + Plugin.Describe(head) + " carried=" + session.Carried.Count + ".");
+        }
+
+        private static void QueuePickup(CondOwner hauler, BigLooseHaulSession session, CondOwner item)
+        {
+            try
+            {
+                var pickup = Plugin.GetAcquireInteractionForMode(hauler, item, session.Mode, out var pickupReason);
+                if (pickup == null)
+                {
+                    Plugin.Warn("[" + ModeMarker(session.Mode, "QueuePickup") + "] failed: no acquire interaction for item=" + Plugin.Describe(item) + " reason=" + pickupReason + ".");
+                    return;
+                }
+
+                pickup.bManual = true;
+                session.Pending.Remove(item);
+                session.CurrentPickup = item;
+
+                var queued = hauler.QueueInteraction(item, pickup);
+                if (!queued)
+                {
+                    session.CurrentPickup = null;
+                    CountFailedAttempt(session, item);
+                    BigHaulRegistry.MarkState(item, "SkippedNoPath", "pickup queue refused by vanilla pathing");
+                    Plugin.Warn("[" + ModeMarker(session.Mode, "QueuePickup") + "] failed: hauler=" + Plugin.SafeName(hauler) + " item=" + Plugin.Describe(item) + " queue=" + Plugin.QueueSummary(hauler) + ".");
+                    return;
+                }
+
+                string fitReason;
+                CanAcquireNext(hauler, item, session.Mode, out fitReason);
+                Plugin.ModInfo("[" + ModeMarker(session.Mode, "QueuePickup") + "] hauler=" + Plugin.SafeName(hauler) + " item=" + Plugin.Describe(item) + " interaction=" + pickup.strName + " fit=" + fitReason + " pending=" + session.Pending.Count + " carried=" + session.Carried.Count + " queue=" + Plugin.QueueSummary(hauler) + ".");
+            }
+            catch (Exception ex)
+            {
+                session.CurrentPickup = null;
+                if (item != null)
+                    BigHaulRegistry.MarkState(item, "SkippedNoPath", "pickup queue crashed");
+
+                Plugin.Error("[" + ModeMarker(session.Mode, "QueuePickup") + "] crashed: item=" + Plugin.Describe(item) + " error=" + ex);
+            }
+        }
+
+        private static bool LoadNextBatch(CondOwner hauler, BigLooseHaulSession session)
+        {
+            if (session == null || session.Pending.Count > 0 || session.Backlog.Count == 0)
+                return false;
+
+            session.Backlog = session.Backlog
+                .Where(item => IsValidPendingItem(hauler, item, session.Mode))
+                .GroupBy(SafeId)
+                .Select(group => group.First())
+                .ToList();
+
+            if (session.Backlog.Count == 0)
+                return false;
+
+            var count = Math.Min(MaxSessionItems, session.Backlog.Count);
+            session.Pending = session.Backlog.Take(count).ToList();
+            session.Backlog.RemoveRange(0, count);
+            session.DropPhase = false;
+            session.DropAnchorShip = null;
+            session.DropAnchorZone = null;
+            session.DropAnchorPosition = Vector3.zero;
+            Plugin.ModInfo("[BIGBatchStart] hauler=" + session.HaulerName + " pending=" + session.Pending.Count + " backlog=" + session.Backlog.Count + ".");
+            return true;
+        }
+
+        private static void FinishPickup(CondOwner hauler, BigLooseHaulSession session)
+        {
+            var item = session.CurrentPickup;
+            session.CurrentPickup = null;
+
+            if (item == null || item.bDestroyed)
+            {
+                Plugin.Warn("[BIGPicked] pickup target vanished. hauler=" + Plugin.SafeName(hauler) + ".");
+                return;
+            }
+
+            if (IsOwnedByHauler(hauler, item))
+            {
+                TrackSessionCargoKey(session, item);
+                SyncCarriedFromHauler(hauler, session, "after-pickup");
+                var carried = StackHead(item);
+                if (!ContainsSame(session.Carried, carried) && CanAddDirectCarried(session, carried, "after-pickup"))
+                    session.Carried.Add(carried);
+
+                BigHaulRegistry.MarkState(item, "PickedUp", "BIG pickup complete");
+                Plugin.ModInfo("[BIGPicked] hauler=" + Plugin.SafeName(hauler) + " item=" + Plugin.Describe(item) + " carried=" + session.Carried.Count + " pending=" + session.Pending.Count + ".");
+                return;
+            }
+
+            CountFailedAttempt(session, item);
+            var attempts = GetFailedAttempts(session, item);
+            SyncCarriedFromHauler(hauler, session, "pickup-missed");
+
+            if (IsRetainablePendingItem(hauler, item, session))
+            {
+                RequeuePending(session, item);
+
+                if (session.Mode == BigHaulPaintMode.Haul && session.Carried.Count > 0)
+                {
+                    session.DropPhase = true;
+                    string fitReason;
+                    CanAcquireNext(hauler, item, session.Mode, out fitReason);
+                    Plugin.Warn("[BIGPickupDeferred] hauler=" + Plugin.SafeName(hauler)
+                        + " reason=not-owned-after-pickup"
+                        + " attempts=" + attempts
+                        + " item=" + Plugin.Describe(item)
+                        + " fit=" + fitReason
+                        + " pending=" + session.Pending.Count
+                        + " carried=" + session.Carried.Count
+                        + ". Forcing unload before retry.");
+                    return;
+                }
+            }
+
+            if (attempts >= 2)
+            {
+                BigHaulRegistry.MarkState(item, "PickupFailed", "not in inventory after pickup");
+                Plugin.Warn("[BIGPicked] failed twice, skipping item. hauler=" + Plugin.SafeName(hauler) + " item=" + Plugin.Describe(item) + ".");
+                return;
+            }
+
+            if (IsRetainablePendingItem(hauler, item, session))
+                RequeuePending(session, item);
+
+            Plugin.Warn("[BIGPicked] item was not found in BIG hauler inventory; requeued once. hauler=" + Plugin.SafeName(hauler) + " item=" + Plugin.Describe(item) + " pending=" + session.Pending.Count + ".");
+        }
+
+        private static bool QueueNextDrop(CondOwner hauler, BigLooseHaulSession session)
+        {
+            session.DropPhase = true;
+            SyncCarriedFromHauler(hauler, session, "before-drop");
+
+            if (session.Carried.Count == 0)
+                return false;
+
+            var item = session.Carried[0];
+            DropPlan plan;
+            if (!TryFindDropPlan(hauler, item, out plan))
+            {
+                Plugin.Warn("[BIGDropNoTarget] hauler=" + Plugin.SafeName(hauler) + " item=" + Plugin.Describe(item) + " pending=" + session.Pending.Count + " carried=" + session.Carried.Count + ".");
+                return false;
+            }
+
+            plan.Item = item;
+            session.CurrentDrop = plan;
+
+            if (!QueueWalkToDrop(hauler, plan))
+            {
+                session.CurrentDrop = null;
+                Plugin.Warn("[BIGQueueDropWalk] failed: hauler=" + Plugin.SafeName(hauler) + " item=" + Plugin.Describe(item) + " target=" + plan.Summary + ".");
+                return false;
+            }
+
+            if (session.Mode == BigHaulPaintMode.Drag && !QueueStopDrag(hauler))
+            {
+                session.CurrentDrop = null;
+                Plugin.Warn("[BIGDragQueueStop] failed: hauler=" + Plugin.SafeName(hauler) + " item=" + Plugin.Describe(item) + " target=" + plan.Summary + ".");
+                return false;
+            }
+
+            Plugin.ModInfo("[" + ModeMarker(session.Mode, "QueueDropWalk") + "] hauler=" + Plugin.SafeName(hauler) + " item=" + Plugin.Describe(item) + " target=" + plan.Summary + " pending=" + session.Pending.Count + " carried=" + session.Carried.Count + " queue=" + Plugin.QueueSummary(hauler) + ".");
+            return true;
+        }
+
+        private static void FinishDrop(CondOwner hauler, BigLooseHaulSession session)
+        {
+            var plan = session.CurrentDrop;
+            session.CurrentDrop = null;
+
+            if (plan == null || plan.Item == null || plan.Item.bDestroyed)
+            {
+                Plugin.Warn("[BIGDropDone] drop target vanished. hauler=" + Plugin.SafeName(hauler) + ".");
+                return;
+            }
+
+            var item = ResolveOwnedCarried(hauler, plan.Item);
+            if (!IsOwnedByHauler(hauler, item))
+            {
+                RemoveSame(session.Carried, item ?? plan.Item);
+                if (session.Mode == BigHaulPaintMode.Drag)
+                {
+                    BigHaulRegistry.MarkState(plan.Item, "Done", "BIG drag drop complete");
+                    Plugin.ModInfo("[BIGDragDropDone] hauler=" + Plugin.SafeName(hauler) + " item=" + Plugin.Describe(plan.Item) + " target=" + plan.Summary + " pending=" + session.Pending.Count + " carried=" + session.Carried.Count + ".");
+                    return;
+                }
+
+                Plugin.Warn("[" + ModeMarker(session.Mode, "DropDone") + "] carried item no longer belonged to hauler. planned=" + Plugin.Describe(plan.Item) + " resolved=" + Plugin.Describe(item) + ".");
+                return;
+            }
+
+            plan.Item = item;
+
+            if (!ExecuteDrop(hauler, plan))
+            {
+                if (!ContainsSame(session.Carried, item))
+                    session.Carried.Add(item);
+
+                Plugin.Warn("[BIGDropDone] failed: hauler=" + Plugin.SafeName(hauler) + " item=" + Plugin.Describe(item) + " target=" + plan.Summary + ".");
+                return;
+            }
+
+            RemoveSame(session.Carried, item);
+            BigHaulRegistry.MarkState(item, "Done", "BIG drop complete");
+            Plugin.ModInfo("[BIGDropDone] hauler=" + Plugin.SafeName(hauler) + " item=" + Plugin.Describe(item) + " target=" + plan.Summary + " pending=" + session.Pending.Count + " carried=" + session.Carried.Count + ".");
+
+            SyncCarriedFromHauler(hauler, session, "after-drop");
+
+            if (session.Carried.Count == 0)
+            {
+                session.DropPhase = false;
+                session.DropAnchorShip = null;
+                session.DropAnchorZone = null;
+                session.DropAnchorPosition = Vector3.zero;
+                Plugin.ModInfo("[BIGDropPhase] hauler=" + Plugin.SafeName(hauler) + " state=finished pending=" + session.Pending.Count + ".");
+            }
+        }
+
+        private static bool TryFindDropPlan(CondOwner hauler, CondOwner item, out DropPlan best)
+        {
+            best = null;
+
+            try
+            {
+                if (hauler == null || item == null || hauler.ship == null)
+                    return false;
+
+                var zones = hauler.ship.GetZones("IsZoneStockpile", hauler, true);
+                if (zones == null || zones.Count == 0)
+                    return false;
+
+                zones.Sort();
+                var validDest = DataHandler.GetCondTrigger("TIsValidHaulDest");
+                var candidates = new List<DropPlan>();
+
+                foreach (var zone in zones)
+                {
+                    if (zone == null)
+                        continue;
+
+                    Ship zoneShip;
+                    if (zone.strRegID == null || CrewSim.system == null || CrewSim.system.dictShips == null || !CrewSim.system.dictShips.TryGetValue(zone.strRegID, out zoneShip))
+                        continue;
+
+                    if (!MatchesZoneCategory(item, zone))
+                        continue;
+
+                    if (validDest != null)
+                    {
+                        foreach (var existing in zoneShip.GetCOsInZone(zone, validDest, false))
+                        {
+                            if (existing == null || existing == item || existing.bDestroyed)
+                                continue;
+
+                            if (existing.CanStackOnItem(item) < item.StackCount)
+                                continue;
+
+                            var tile = zoneShip.GetTileAtWorldCoords1(existing.tf.position.x, existing.tf.position.y, true);
+                            if (tile == null)
+                                continue;
+
+                            candidates.Add(new DropPlan
+                            {
+                                TargetShip = zoneShip,
+                                Zone = zone,
+                                StackTarget = existing,
+                                WalkTarget = existing,
+                                DropPosition = existing.tf.position,
+                                Score = ScoreDrop(hauler, existing.tf.position, 0),
+                                Summary = "stack ship=" + zoneShip.strRegID + " zone=" + zone.strName + " target=" + Plugin.SafeName(existing)
+                            });
+                        }
+                    }
+
+                    var itemComponent = item.GetComponent<Item>();
+                    if (itemComponent == null)
+                        continue;
+
+                    var emptyCandidates = BuildEmptyDropPlans(hauler, item, itemComponent, zoneShip, zone);
+                    if (emptyCandidates.Count > 0)
+                    {
+                        candidates.AddRange(emptyCandidates);
+                        continue;
+                    }
+
+                    Vector3 fits;
+                    if (TileUtils.TryFitItem(itemComponent, zoneShip, zone, out fits))
+                    {
+                        var tile = zoneShip.GetTileAtWorldCoords1(fits.x, fits.y, true);
+                        if (tile != null && tile.coProps != null)
+                        {
+                            var score = ScoreDrop(hauler, fits, 1000);
+                            if (hauler != null)
+                            {
+                                BigLooseHaulSession session;
+                                if (ActiveSessions.TryGetValue(SafeId(hauler), out session) && session.DropPhase && session.DropAnchorShip == zoneShip && session.DropAnchorZone == zone)
+                                    score = ScoreDropAnchor(session, fits);
+                            }
+
+                            candidates.Add(new DropPlan
+                            {
+                                TargetShip = zoneShip,
+                                Zone = zone,
+                                WalkTarget = tile.coProps,
+                                DropPosition = new Vector3(fits.x, fits.y, item.tf.position.z),
+                                Score = score,
+                                Summary = "empty-fallback ship=" + zoneShip.strRegID + " zone=" + zone.strName + " tile=" + tile.Index
+                            });
+                        }
                     }
                 }
 
-                var selected = remaining[bestIndex];
-                remaining.RemoveAt(bestIndex);
-                orderedTargets.Add(selected);
+                best = candidates.OrderBy(candidate => candidate.Score).FirstOrDefault();
+                BigLooseHaulSession anchorSession;
+                if (best != null && hauler != null && ActiveSessions.TryGetValue(SafeId(hauler), out anchorSession) && anchorSession.DropPhase)
+                    EnsureDropAnchor(anchorSession, best);
+                return best != null;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Warn("[BIGDropPlan] failed: item=" + Plugin.Describe(item) + " error=" + ex.Message);
+                return false;
+            }
+        }
 
-                if (selected.Tile != null)
-                    currentTile = selected.Tile;
+        private static List<DropPlan> BuildEmptyDropPlans(CondOwner hauler, CondOwner item, Item itemComponent, Ship zoneShip, JsonZone zone)
+        {
+            var plans = new List<DropPlan>();
+
+            try
+            {
+                if (item == null || itemComponent == null || zoneShip == null || zone == null || zone.aTiles == null || zone.aTiles.Length == 0)
+                    return plans;
+
+                BigLooseHaulSession session = null;
+                if (hauler != null)
+                    ActiveSessions.TryGetValue(SafeId(hauler), out session);
+
+                Vector3 anchor;
+                if (!TryGetDropSpiralAnchor(session, zoneShip, zone, out anchor))
+                    anchor = item.tf != null ? item.tf.position : Vector3.zero;
+
+                foreach (var tileIndex in zone.aTiles)
+                {
+                    var coords = zoneShip.GetWorldCoordsAtTileIndex1(tileIndex);
+                    var pos = new Vector3(coords.x, coords.y, item.tf != null ? item.tf.position.z : 0f);
+                    var tile = zoneShip.GetTileAtWorldCoords1(pos.x, pos.y, true);
+                    if (tile == null || tile.coProps == null)
+                        continue;
+
+                    if (!CanItemFitAt(itemComponent, zoneShip, zone, pos))
+                        continue;
+
+                    plans.Add(new DropPlan
+                    {
+                        TargetShip = zoneShip,
+                        Zone = zone,
+                        WalkTarget = tile.coProps,
+                        DropPosition = pos,
+                        Score = ScoreDropSpiral(hauler, anchor, pos, 1000),
+                        Summary = "empty-spiral ship=" + zoneShip.strRegID + " zone=" + zone.strName + " tile=" + tile.Index
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Warn("[BIGDropSpiral] failed: item=" + Plugin.Describe(item) + " error=" + ex.Message);
             }
 
-            var changed = false;
-            for (var i = 0; i < orderedTargets.Count; i++)
+            return plans;
+        }
+
+        private static bool CanItemFitAt(Item itemComponent, Ship zoneShip, JsonZone zone, Vector3 pos)
+        {
+            try
             {
-                if (orderedTargets[i].Chain != chains[i])
+                return itemComponent != null && itemComponent.CheckFit(pos, zoneShip, null, zone);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool TryGetDropSpiralAnchor(BigLooseHaulSession session, Ship zoneShip, JsonZone zone, out Vector3 anchor)
+        {
+            anchor = Vector3.zero;
+
+            if (session != null
+                && session.DropPhase
+                && session.DropAnchorShip == zoneShip
+                && session.DropAnchorZone == zone)
+            {
+                anchor = session.DropAnchorPosition;
+                return true;
+            }
+
+            return TryGetZoneSpiralAnchor(zoneShip, zone, out anchor);
+        }
+
+        private static bool TryGetZoneSpiralAnchor(Ship zoneShip, JsonZone zone, out Vector3 anchor)
+        {
+            anchor = Vector3.zero;
+
+            try
+            {
+                if (zoneShip == null || zone == null || zone.aTiles == null || zone.aTiles.Length == 0)
+                    return false;
+
+                var coords = zone.aTiles
+                    .Select(tileIndex => zoneShip.GetWorldCoordsAtTileIndex1(tileIndex))
+                    .ToList();
+
+                if (coords.Count == 0)
+                    return false;
+
+                var avgX = coords.Average(pos => pos.x);
+                var avgY = coords.Average(pos => pos.y);
+                var best = coords
+                    .OrderBy(pos =>
+                    {
+                        var dx = pos.x - avgX;
+                        var dy = pos.y - avgY;
+                        return dx * dx + dy * dy;
+                    })
+                    .First();
+
+                anchor = new Vector3(best.x, best.y, 0f);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool QueueWalkToDrop(CondOwner hauler, DropPlan plan)
+        {
+            if (hauler == null || plan == null || plan.WalkTarget == null)
+                return false;
+
+            Interaction walk = null;
+            JsonInteraction walkTemplate;
+            if (DataHandler.dictInteractions != null && DataHandler.dictInteractions.TryGetValue("ACTHaulItem", out walkTemplate) && walkTemplate != null)
+                walk = new Interaction(walkTemplate);
+
+            if (walk == null)
+                walk = DataHandler.GetInteraction("ACTHaulItem");
+
+            if (walk == null)
+                return false;
+
+            walk.strName = "BIGWalkToDrop";
+            walk.strTitle = "BIG Walk To Drop";
+            walk.strDesc = "[us] [is] walking to a BIG drop target.";
+            walk.strTooltip = "BIG internal movement.";
+            walk.strDuty = null;
+            walk.strMapIcon = null;
+            walk.strTargetPoint = "use";
+            walk.fTargetPointRange = 1f;
+            walk.fDuration = 0.000027;
+            walk.bManual = true;
+            walk.bNoRemember = true;
+
+            return hauler.QueueInteraction(plan.WalkTarget, walk);
+        }
+
+        private static bool QueueStopDrag(CondOwner hauler)
+        {
+            if (hauler == null)
+                return false;
+
+            var stopDrag = Plugin.GetStopDragInteraction();
+            if (stopDrag == null)
+                return false;
+
+            stopDrag.bManual = true;
+            return hauler.QueueInteraction(hauler, stopDrag);
+        }
+
+        private static bool ExecuteDrop(CondOwner hauler, DropPlan plan)
+        {
+            try
+            {
+                if (hauler == null || plan == null || plan.Item == null || plan.TargetShip == null)
+                    return false;
+
+                var item = StackHead(plan.Item);
+                if (item == null || item.bDestroyed)
+                    return false;
+
+                if (plan.StackTarget != null && !plan.StackTarget.bDestroyed && plan.StackTarget.CanStackOnItem(item) >= item.StackCount)
                 {
-                    changed = true;
-                    break;
+                    Plugin.ModInfo("[BIGDropVisual] mode=stack before item=" + Plugin.Describe(item) + " target=" + plan.Summary + " state=" + DropVisualState(item) + ".");
+                    item.RemoveFromCurrentHome(true);
+                    var remainder = plan.StackTarget.StackCO(item);
+                    Plugin.ModInfo("[BIGDropVisual] mode=stack after item=" + Plugin.Describe(item) + " target=" + plan.Summary + " remainder=" + Plugin.Describe(remainder) + " stackState=" + DropVisualState(plan.StackTarget) + ".");
+                    return remainder == null;
+                }
+
+                if (hauler.tf == null)
+                    return false;
+
+                var offset = plan.DropPosition - hauler.tf.position;
+                var sortingProvider = BuildDropSortingProvider(plan.TargetShip, plan.DropPosition);
+                Plugin.ModInfo("[BIGDropVisual] mode=vanilla-empty before item=" + Plugin.Describe(item) + " target=" + plan.Summary + " offset=(" + offset.x.ToString("0.00") + "," + offset.y.ToString("0.00") + ") state=" + DropVisualState(item) + ".");
+
+                var leftover = hauler.DropCO(item, false, plan.TargetShip, offset.x, offset.y, true, sortingProvider);
+
+                Plugin.ModInfo("[BIGDropVisual] mode=vanilla-empty after item=" + Plugin.Describe(item) + " target=" + plan.Summary + " leftover=" + Plugin.Describe(leftover) + " state=" + DropVisualState(item) + ".");
+                return leftover == null && item.ship == plan.TargetShip;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Warn("[BIGDropExecute] failed: " + ex.Message);
+                return false;
+            }
+        }
+
+        private static Func<int[], int[]> BuildDropSortingProvider(Ship ship, Vector3 dropPosition)
+        {
+            try
+            {
+                if (ship == null)
+                    return null;
+
+                var targetTile = ship.GetTileAtWorldCoords1(dropPosition.x, dropPosition.y, true);
+                if (targetTile == null)
+                    return null;
+
+                var targetIndex = targetTile.Index;
+                return tiles =>
+                {
+                    if (tiles == null || tiles.Length == 0)
+                        return tiles;
+
+                    return tiles
+                        .OrderBy(tileIndex => tileIndex == targetIndex ? 0 : 1)
+                        .ThenBy(tileIndex => DropTileSpiralScore(ship, tileIndex, dropPosition))
+                        .ToArray();
+                };
+            }
+            catch (Exception ex)
+            {
+                Plugin.Warn("[BIGDropSort] failed: " + ex.Message);
+                return null;
+            }
+        }
+
+        private static int DropTileSpiralScore(Ship ship, int tileIndex, Vector3 anchor)
+        {
+            try
+            {
+                var coords = ship.GetWorldCoordsAtTileIndex1(tileIndex);
+                return ScoreSpiralFromAnchor(anchor, new Vector3(coords.x, coords.y, anchor.z));
+            }
+            catch
+            {
+                return int.MaxValue;
+            }
+        }
+
+        private static string DropVisualState(CondOwner item)
+        {
+            if (item == null)
+                return "<null>";
+
+            try
+            {
+                var pos = item.tf != null ? item.tf.position : Vector3.zero;
+                var shipId = item.ship != null ? item.ship.strRegID : "<none>";
+                var parent = item.objCOParent != null ? Plugin.SafeName(item.objCOParent) : "<none>";
+                var tile = "<none>";
+
+                if (item.ship != null)
+                {
+                    var tileRef = item.ship.GetTileAtWorldCoords1(pos.x, pos.y, true);
+                    if (tileRef != null)
+                        tile = tileRef.Index.ToString();
+                }
+
+                return "ship=" + shipId
+                    + " tile=" + tile
+                    + " parent=" + parent
+                    + " visible=" + item.Visible
+                    + " pos=(" + pos.x.ToString("0.00") + "," + pos.y.ToString("0.00") + "," + pos.z.ToString("0.00") + ")"
+                    + " render=" + RendererState(item);
+            }
+            catch (Exception ex)
+            {
+                return "<state-error " + ex.Message + ">";
+            }
+        }
+
+        private static string RendererState(CondOwner item)
+        {
+            try
+            {
+                if (item == null || item.tf == null)
+                    return "<none>";
+
+                var renderers = item.tf.GetComponentsInChildren<Renderer>(true);
+                if (renderers == null || renderers.Length == 0)
+                    return "<none>";
+
+                var renderer = renderers[0];
+                if (renderer == null)
+                    return "count=" + renderers.Length + " first=<null>";
+
+                return "count=" + renderers.Length
+                    + " firstEnabled=" + renderer.enabled
+                    + " layer=" + renderer.sortingLayerName
+                    + " order=" + renderer.sortingOrder;
+            }
+            catch (Exception ex)
+            {
+                return "<renderer-error " + ex.Message + ">";
+            }
+        }
+
+        private static bool HasAnyFittablePending(CondOwner hauler, BigLooseHaulSession session)
+        {
+            foreach (var item in session.Pending)
+            {
+                if (IsValidPendingItem(hauler, item, session.Mode) && CanAcquireNext(hauler, item, session.Mode))
+                    return true;
+            }
+
+            if (session.Pending.Count == 0 && session.Backlog.Any(item => IsValidPendingItem(hauler, item, session.Mode) && CanAcquireNext(hauler, item, session.Mode)))
+                return true;
+
+            return false;
+        }
+
+        private static CondOwner FindNearestFittablePending(CondOwner hauler, BigLooseHaulSession session)
+        {
+            CondOwner best = null;
+            var bestScore = float.MaxValue;
+            var noPath = new List<CondOwner>();
+
+            foreach (var item in session.Pending)
+            {
+                if (!IsValidPendingItem(hauler, item, session.Mode))
+                    continue;
+
+                string fitReason;
+                if (!CanAcquireNext(hauler, item, session.Mode, out fitReason))
+                    continue;
+
+                var pickup = Plugin.GetAcquireInteractionForMode(hauler, item, session.Mode, out var pickupReason);
+                if (pickup == null)
+                {
+                    noPath.Add(item);
+                    continue;
+                }
+
+                pickup.bManual = true;
+
+                var score = PickupSortScore(hauler, item, pickup);
+                if (score >= float.MaxValue * 0.5f)
+                {
+                    noPath.Add(item);
+                    continue;
+                }
+
+                if (score >= bestScore)
+                    continue;
+
+                best = item;
+                bestScore = score;
+            }
+
+            foreach (var item in noPath)
+            {
+                RemoveSame(session.Pending, item);
+                RemoveSame(session.Backlog, item);
+                BigHaulRegistry.MarkState(item, "SkippedNoPath", "no reachable path before pickup");
+            }
+
+            if (noPath.Count > 0)
+                Plugin.Warn("[" + ModeMarker(session.Mode, "SkipNoPath") + "] hauler=" + Plugin.SafeName(hauler) + " count=" + noPath.Count + " pending=" + session.Pending.Count + " backlog=" + session.Backlog.Count + ".");
+
+            if (best != null)
+            {
+                string fitReason;
+                CanAcquireNext(hauler, best, session.Mode, out fitReason);
+                Plugin.ModInfo("[" + ModeMarker(session.Mode, "PickupScore") + "] hauler=" + Plugin.SafeName(hauler) + " item=" + Plugin.Describe(best) + " score=" + bestScore.ToString("0.0") + " sameShip=" + IsSameShip(hauler, best) + " fit=" + fitReason + ".");
+            }
+
+            return best;
+        }
+
+        private static bool CanAcquireNext(CondOwner hauler, CondOwner item, BigHaulPaintMode mode)
+        {
+            string reason;
+            return CanAcquireNext(hauler, item, mode, out reason);
+        }
+
+        private static bool CanAcquireNext(CondOwner hauler, CondOwner item, BigHaulPaintMode mode, out string reason)
+        {
+            reason = null;
+
+            switch (mode)
+            {
+                case BigHaulPaintMode.Drag:
+                    if (GetDragSlotItem(hauler) == null && !HasCond(hauler, "IsDragging"))
+                    {
+                        reason = "drag-slot-free";
+                        return true;
+                    }
+
+                    reason = "drag-slot-occupied";
+                    return false;
+                default:
+                    string helperReason;
+                    if (CanFitInventory(hauler, item))
+                    {
+                        reason = "inventory";
+                        return true;
+                    }
+
+                    if (Plugin.CanFitHaulHelper(hauler, item, out helperReason))
+                    {
+                        reason = "helper:" + helperReason;
+                        return true;
+                    }
+
+                    reason = "no-space:" + helperReason;
+                    return false;
+            }
+        }
+
+        private static CondOwner GetDragSlotItem(CondOwner hauler)
+        {
+            try
+            {
+                return hauler?.compSlots?.GetSlot("drag")?.GetOutermostCO();
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static bool HasCond(CondOwner co, string cond)
+        {
+            try
+            {
+                return co != null && co.HasCond(cond);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool CanFitInventory(CondOwner hauler, CondOwner item)
+        {
+            try
+            {
+                if (hauler == null || item == null)
+                    return false;
+
+                if (hauler.objContainer != null && hauler.objContainer.CanFit(item, false, true))
+                    return true;
+
+                if (hauler.compSlots == null)
+                    return false;
+
+                foreach (var slot in hauler.compSlots.GetSlotsHeldFirst(true))
+                {
+                    if (slot != null && slot.CanFit(item, false, true))
+                        return true;
+                }
+
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Warn("[BIGCanFit] failed: hauler=" + Plugin.SafeName(hauler) + " item=" + Plugin.Describe(item) + " error=" + ex.Message);
+                return false;
+            }
+        }
+
+        private static bool MatchesZoneCategory(CondOwner item, JsonZone zone)
+        {
+            if (zone.categoryConds == null || zone.categoryConds.Length == 0)
+                return true;
+
+            foreach (var cond in zone.categoryConds)
+            {
+                try
+                {
+                    if (item.HasCond(cond))
+                        return true;
+                }
+                catch
+                {
+                    // Bad or stale category conditions should just fail this zone.
                 }
             }
 
-            chains.Clear();
-            foreach (var target in orderedTargets)
-                chains.Add(target.Chain);
-
-            Plugin.ModInfo("[V2PickupSort] hauler=" + SafeCO(hauler)
-                + " count=" + chains.Count
-                + " changed=" + changed
-                + " pathScores=" + usedPathScores
-                + " fallbackScores=" + usedFallbackScores
-                + " order={" + PickupOrderSummary(orderedTargets, 10) + "}");
+            return false;
         }
 
-        private static PickupSortScore ScorePickupTarget(CondOwner hauler, Tile currentTile, PickupSortTarget target)
+        private static void PruneSession(CondOwner hauler, BigLooseHaulSession session)
         {
-            var score = new PickupSortScore
-            {
-                OriginalIndex = target?.OriginalIndex ?? int.MaxValue,
-                SameRoom = SameRoom(currentTile, target?.Tile),
-                TileRange = TileRangeSafe(currentTile, target?.Tile),
-                Cost = float.MaxValue,
-                UsedPath = false
-            };
+            session.Pending = session.Pending
+                .Where(item => IsRetainablePendingItem(hauler, item, session))
+                .GroupBy(SafeId)
+                .Select(group => group.First())
+                .ToList();
 
-            if (target == null)
-                return score;
+            session.Backlog = session.Backlog
+                .Where(item => IsRetainablePendingItem(hauler, item, session))
+                .GroupBy(SafeId)
+                .Select(group => group.First())
+                .ToList();
 
-            if (TryGetPathCost(hauler, currentTile, target.Tile, target.Chain?.Item, target.Chain?.Pickup, out var pathCost))
+            session.Carried = session.Carried
+                .Where(item => item != null && !item.bDestroyed)
+                .Select(StackHead)
+                .Where(item => item != null)
+                .GroupBy(SafeId)
+                .Select(group => group.First())
+                .ToList();
+        }
+
+        private static bool IsRetainablePendingItem(CondOwner hauler, CondOwner item, BigLooseHaulSession session)
+        {
+            try
             {
-                score.Cost = pathCost;
-                score.UsedPath = true;
-                return score;
+                if (session == null)
+                    return false;
+
+                if (IsValidPendingItem(hauler, item, session.Mode))
+                    return true;
+
+                if (session.Mode != BigHaulPaintMode.Haul)
+                    return false;
+
+                string reason;
+                return Plugin.IsHaulCandidateIgnoringCurrentCapacity(item, out reason);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool IsValidPendingItem(CondOwner hauler, CondOwner item, BigHaulPaintMode mode)
+        {
+            try
+            {
+                string reason;
+                return Plugin.IsCandidateForMode(hauler, item, mode, out reason);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static void RequeuePending(BigLooseHaulSession session, CondOwner item)
+        {
+            if (session == null || item == null)
+                return;
+
+            RemoveSame(session.Pending, item);
+            RemoveSame(session.Backlog, item);
+            session.Pending.Insert(0, item);
+        }
+
+        internal static bool CancelSession(CondOwner hauler, string reason, bool clearQueue)
+        {
+            if (hauler == null)
+                return false;
+
+            BigLooseHaulSession session;
+            var haulerId = SafeId(hauler);
+            if (string.IsNullOrEmpty(haulerId) || !ActiveSessions.TryGetValue(haulerId, out session))
+                return false;
+
+            ActiveSessions.Remove(haulerId);
+
+            if (session.CurrentPickup != null && IsValidPendingItem(hauler, session.CurrentPickup, session.Mode))
+                BigHaulRegistry.MarkState(session.CurrentPickup, "Cancelled", reason);
+
+            foreach (var item in session.Pending.ToList())
+                BigHaulRegistry.MarkState(item, "Cancelled", reason);
+
+            foreach (var item in session.Backlog.ToList())
+                BigHaulRegistry.MarkState(item, "Cancelled", reason);
+
+            if (clearQueue)
+                SafeClearQueue(hauler, "cancel BIG session: " + reason);
+
+            Plugin.Warn("[BIGCancel] hauler=" + Plugin.SafeName(hauler)
+                + " reason=" + reason
+                + " pending=" + session.Pending.Count
+                + " backlog=" + session.Backlog.Count
+                + " carried=" + session.Carried.Count
+                + " currentPickup=" + Plugin.Describe(session.CurrentPickup)
+                + " currentDrop=" + (session.CurrentDrop != null ? session.CurrentDrop.Summary : "<none>")
+                + ".");
+            return true;
+        }
+
+        internal static bool PauseSessionForPlayerOrder(CondOwner hauler, string reason, bool clearQueue)
+        {
+            if (hauler == null)
+                return false;
+
+            BigLooseHaulSession session;
+            var haulerId = SafeId(hauler);
+            if (string.IsNullOrEmpty(haulerId) || !ActiveSessions.TryGetValue(haulerId, out session))
+                return false;
+
+            SyncCarriedFromHauler(hauler, session, "pause-player-order");
+
+            if (session.CurrentPickup != null)
+            {
+                var pickup = session.CurrentPickup;
+                session.CurrentPickup = null;
+
+                if (IsOwnedByHauler(hauler, pickup))
+                {
+                    var carried = StackHead(pickup);
+                    if (!ContainsSame(session.Carried, carried))
+                        session.Carried.Add(carried);
+
+                    BigHaulRegistry.MarkState(pickup, "PickedUp", "BIG pickup completed before pause");
+                }
+                else if (IsValidPendingItem(hauler, pickup, session.Mode) && !ContainsSame(session.Pending, pickup))
+                {
+                    session.Pending.Insert(0, pickup);
+                }
             }
 
-            score.Cost = FallbackDistanceSq(hauler, currentTile, target);
+            if (session.CurrentDrop != null)
+            {
+                var drop = session.CurrentDrop;
+                session.CurrentDrop = null;
+
+                var item = drop.Item != null ? ResolveOwnedCarried(hauler, drop.Item) : null;
+                if (item != null && !IsOwnedByHauler(hauler, item))
+                {
+                    RemoveSame(session.Carried, item);
+                    BigHaulRegistry.MarkState(item, "Done", "BIG drop completed before pause");
+                }
+                else if (session.Carried.Count > 0)
+                {
+                    session.DropPhase = true;
+                }
+            }
+
+            if (clearQueue)
+                SafeClearQueue(hauler, "pause BIG session: " + reason);
+
+            session.AutoPausedLogged = false;
+            Plugin.Warn("[BIGPause] hauler=" + Plugin.SafeName(hauler)
+                + " reason=" + reason
+                + " pending=" + session.Pending.Count
+                + " backlog=" + session.Backlog.Count
+                + " carried=" + session.Carried.Count
+                + " dropPhase=" + session.DropPhase
+                + " queue=" + Plugin.QueueSummary(hauler) + ".");
+            return true;
+        }
+
+        internal static bool CancelPendingItemById(string itemId, string reason)
+        {
+            if (string.IsNullOrEmpty(itemId))
+                return false;
+
+            var changed = false;
+            foreach (var session in ActiveSessions.Values.ToList())
+            {
+                var removed = session.Pending.RemoveAll(item => SafeId(item) == itemId);
+                var removedBacklog = session.Backlog.RemoveAll(item => SafeId(item) == itemId);
+                if (removed > 0)
+                {
+                    changed = true;
+                    Plugin.Warn("[BIGCancelItem] hauler=" + session.HaulerName + " reason=" + reason + " itemId=" + itemId + " removed=" + removed + " pending=" + session.Pending.Count + ".");
+                }
+
+                if (removedBacklog > 0)
+                {
+                    changed = true;
+                    Plugin.Warn("[BIGCancelItem] hauler=" + session.HaulerName + " reason=" + reason + " itemId=" + itemId + " removedBacklog=" + removedBacklog + " backlog=" + session.Backlog.Count + ".");
+                }
+
+                if (session.CurrentPickup != null && SafeId(session.CurrentPickup) == itemId)
+                {
+                    changed = true;
+                    BigHaulRegistry.MarkState(session.CurrentPickup, "Cancelled", reason);
+                    session.CurrentPickup = null;
+                    Plugin.Warn("[BIGCancelItem] hauler=" + session.HaulerName + " reason=" + reason + " currentPickup=" + itemId + ".");
+                }
+            }
+
+            if (BigHaulRegistry.CancelById(itemId, reason))
+                changed = true;
+
+            return changed;
+        }
+
+        private static bool IsAutoTaskingEnabled(CondOwner hauler)
+        {
+            try
+            {
+                return hauler != null && !hauler.HasCond("IsAIManual");
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool IsOwnedByHauler(CondOwner hauler, CondOwner item)
+        {
+            try
+            {
+                if (hauler == null || item == null)
+                    return false;
+
+                var cursor = item;
+                for (var i = 0; i < 16 && cursor != null; i++)
+                {
+                    if (cursor == hauler || SafeId(cursor) == SafeId(hauler))
+                        return true;
+
+                    cursor = cursor.objCOParent;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+
+            return false;
+        }
+
+        private static CondOwner ResolveOwnedCarried(CondOwner hauler, CondOwner item)
+        {
+            try
+            {
+                var head = StackHead(item);
+                if (head != null && !head.bDestroyed && IsOwnedByHauler(hauler, head))
+                    return head;
+
+                var itemKey = InventoryCargoKey(item);
+                if (string.IsNullOrEmpty(itemKey) || hauler == null)
+                    return null;
+
+                foreach (var candidate in hauler.GetCOsSafe(true))
+                {
+                    var candidateHead = StackHead(candidate);
+                    if (candidateHead == null || candidateHead.bDestroyed)
+                        continue;
+
+                    if (InventoryCargoKey(candidateHead) == itemKey && IsOwnedByHauler(hauler, candidateHead))
+                        return candidateHead;
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Warn("[BIGResolveCarried] failed: item=" + Plugin.Describe(item) + " error=" + ex.Message);
+            }
+
+            return null;
+        }
+
+        private static void SyncCarriedFromHauler(CondOwner hauler, BigLooseHaulSession session, string reason)
+        {
+            try
+            {
+                if (hauler == null || session == null)
+                    return;
+
+                var synced = session.Carried
+                    .Select(item => ResolveOwnedCarried(hauler, item))
+                    .Where(item => item != null)
+                    .Select(StackHead)
+                    .Where(item => item != null && !item.bDestroyed)
+                    .ToList();
+
+                foreach (var candidate in hauler.GetCOsSafe(true))
+                {
+                    var head = StackHead(candidate);
+                    if (head == null || head.bDestroyed)
+                        continue;
+
+                    if (!IsOwnedByHauler(hauler, head))
+                        continue;
+
+                    if (!BigHaulRegistry.IsTracked(head))
+                        continue;
+
+                    if (!ContainsSame(synced, head))
+                        synced.Add(head);
+                }
+
+                SyncHaulHelperContentsFromHauler(hauler, session, synced, reason);
+                SyncInventoryDeltaFromHauler(hauler, session, synced, reason);
+
+                if (session.Mode == BigHaulPaintMode.Drag)
+                {
+                    var dragged = GetDragSlotItem(hauler);
+                    var draggedHead = StackHead(dragged);
+                    if (draggedHead != null && !draggedHead.bDestroyed && !ContainsSame(synced, draggedHead))
+                        synced.Add(draggedHead);
+                }
+
+                session.Carried = synced
+                    .GroupBy(SafeId)
+                    .Select(group => group.First())
+                    .ToList();
+
+                Plugin.ModInfo("[BIGCarrySync] hauler=" + Plugin.SafeName(hauler) + " reason=" + reason + " carried=" + session.Carried.Count + ".");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Warn("[BIGCarrySync] failed: hauler=" + Plugin.SafeName(hauler) + " reason=" + reason + " error=" + ex.Message);
+            }
+        }
+
+        private static void SyncHaulHelperContentsFromHauler(CondOwner hauler, BigLooseHaulSession session, List<CondOwner> carried, string reason)
+        {
+            try
+            {
+                if (hauler == null || session == null || carried == null || session.Mode != BigHaulPaintMode.Haul)
+                    return;
+
+                var helpers = Plugin.GetHaulHelpersForHauler(hauler).ToList();
+                if (helpers.Count == 0)
+                    return;
+
+                var scanned = 0;
+                var added = 0;
+                foreach (var helper in helpers)
+                {
+                    foreach (var cargo in Plugin.GetDirectHaulHelperCargo(helper))
+                    {
+                        scanned++;
+
+                        var head = StackHead(cargo);
+                        if (head == null || head.bDestroyed)
+                            continue;
+
+                        if (!IsOwnedByHauler(hauler, head))
+                            continue;
+
+                        if (ContainsSame(carried, head))
+                            continue;
+
+                        TrackSessionCargoKey(session, head);
+                        carried.Add(head);
+                        added++;
+                    }
+                }
+
+                if (added > 0)
+                {
+                    Plugin.ModInfo("[BIGHelperDrain] hauler=" + Plugin.SafeName(hauler)
+                        + " reason=" + reason
+                        + " helpers=" + helpers.Count
+                        + " scanned=" + scanned
+                        + " added=" + added
+                        + " carried=" + carried.Count + ".");
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Warn("[BIGHelperDrain] failed: hauler=" + Plugin.SafeName(hauler) + " reason=" + reason + " error=" + ex.Message);
+            }
+        }
+
+        private static void TrackSessionCargoKeys(BigLooseHaulSession session, IEnumerable<CondOwner> items)
+        {
+            if (items == null)
+                return;
+
+            foreach (var item in items)
+                TrackSessionCargoKey(session, item);
+        }
+
+        private static void TrackSessionCargoKey(BigLooseHaulSession session, CondOwner item)
+        {
+            if (session == null || session.Mode != BigHaulPaintMode.Haul)
+                return;
+
+            var key = InventoryCargoKey(item);
+            if (!string.IsNullOrEmpty(key))
+                session.SessionCargoKeys.Add(key);
+        }
+
+        private static bool CanAddDirectCarried(BigLooseHaulSession session, CondOwner item, string reason)
+        {
+            if (session == null || item == null || session.Mode != BigHaulPaintMode.Haul)
+                return true;
+
+            var id = SafeId(item);
+            if (string.IsNullOrEmpty(id) || !session.BaselineInventoryIds.Contains(id))
+                return true;
+
+            var key = InventoryCargoKey(item);
+            if (session.BaselineMergeWarnings.Add(key ?? id))
+            {
+                Plugin.Warn("[BIGInventoryDelta] protected pre-existing stack from direct pickup add: hauler=" + session.HaulerName
+                    + " reason=" + reason
+                    + " key=" + (key ?? "<no key>")
+                    + " item=" + Plugin.Describe(item) + ".");
+            }
+
+            return false;
+        }
+
+        private static void CaptureInventoryBaseline(CondOwner hauler, BigLooseHaulSession session, string reason)
+        {
+            try
+            {
+                if (hauler == null || session == null || session.Mode != BigHaulPaintMode.Haul || session.InventoryBaselineCaptured)
+                    return;
+
+                foreach (var item in GetOwnedInventoryCargo(hauler))
+                {
+                    var key = InventoryCargoKey(item);
+                    if (string.IsNullOrEmpty(key))
+                        continue;
+
+                    AddCount(session.BaselineInventoryCounts, key, StackCountSafe(item));
+
+                    var id = SafeId(item);
+                    if (!string.IsNullOrEmpty(id))
+                        session.BaselineInventoryIds.Add(id);
+                }
+
+                session.InventoryBaselineCaptured = true;
+                Plugin.ModInfo("[BIGInventoryBaseline] hauler=" + Plugin.SafeName(hauler)
+                    + " reason=" + reason
+                    + " items=" + session.BaselineInventoryIds.Count
+                    + " defs=" + session.BaselineInventoryCounts.Count
+                    + " counts=" + CountSummary(session.BaselineInventoryCounts) + ".");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Warn("[BIGInventoryBaseline] failed: hauler=" + Plugin.SafeName(hauler) + " reason=" + reason + " error=" + ex.Message);
+            }
+        }
+
+        private static void SyncInventoryDeltaFromHauler(CondOwner hauler, BigLooseHaulSession session, List<CondOwner> carried, string reason)
+        {
+            try
+            {
+                if (hauler == null || session == null || carried == null || session.Mode != BigHaulPaintMode.Haul)
+                    return;
+
+                if (!session.InventoryBaselineCaptured)
+                    CaptureInventoryBaseline(hauler, session, "late-" + reason);
+
+                if (session.SessionCargoKeys.Count == 0)
+                    return;
+
+                var current = GetOwnedInventoryCargo(hauler);
+                var currentCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+                foreach (var item in current)
+                {
+                    var key = InventoryCargoKey(item);
+                    if (!string.IsNullOrEmpty(key))
+                        AddCount(currentCounts, key, StackCountSafe(item));
+                }
+
+                var added = 0;
+                var protectedBaseline = 0;
+                foreach (var item in current)
+                {
+                    var head = StackHead(item);
+                    if (head == null || head.bDestroyed || ContainsSame(carried, head))
+                        continue;
+
+                    var key = InventoryCargoKey(head);
+                    if (string.IsNullOrEmpty(key) || !session.SessionCargoKeys.Contains(key))
+                        continue;
+
+                    var baselineCount = CountFor(session.BaselineInventoryCounts, key);
+                    var currentCount = CountFor(currentCounts, key);
+                    if (currentCount <= baselineCount)
+                        continue;
+
+                    var id = SafeId(head);
+                    if (!string.IsNullOrEmpty(id) && session.BaselineInventoryIds.Contains(id))
+                    {
+                        protectedBaseline++;
+                        if (session.BaselineMergeWarnings.Add(key))
+                        {
+                            Plugin.Warn("[BIGInventoryDelta] protected pre-existing stack from auto-drop: hauler=" + Plugin.SafeName(hauler)
+                                + " key=" + key
+                                + " baseline=" + baselineCount
+                                + " current=" + currentCount
+                                + " item=" + Plugin.Describe(head) + ".");
+                        }
+
+                        continue;
+                    }
+
+                    carried.Add(head);
+                    added++;
+                }
+
+                if (added > 0 || protectedBaseline > 0)
+                {
+                    Plugin.ModInfo("[BIGInventoryDelta] hauler=" + Plugin.SafeName(hauler)
+                        + " reason=" + reason
+                        + " scanned=" + current.Count
+                        + " added=" + added
+                        + " protectedBaseline=" + protectedBaseline
+                        + " carried=" + carried.Count
+                        + " sessionDefs=" + session.SessionCargoKeys.Count
+                        + " current=" + CountSummary(currentCounts) + ".");
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Warn("[BIGInventoryDelta] failed: hauler=" + Plugin.SafeName(hauler) + " reason=" + reason + " error=" + ex.Message);
+            }
+        }
+
+        private static List<CondOwner> GetOwnedInventoryCargo(CondOwner hauler)
+        {
+            var result = new List<CondOwner>();
+            var seen = new HashSet<string>();
+
+            try
+            {
+                if (hauler == null)
+                    return result;
+
+                foreach (var candidate in hauler.GetCOsSafe(true))
+                {
+                    var head = StackHead(candidate);
+                    if (head == null || head.bDestroyed || head == hauler)
+                        continue;
+
+                    if (!IsOwnedByHauler(hauler, head))
+                        continue;
+
+                    string rejectReason;
+                    if (!Plugin.IsInventoryDeltaHaulCargo(head, out rejectReason))
+                        continue;
+
+                    var id = SafeId(head);
+                    if (!string.IsNullOrEmpty(id) && !seen.Add(id))
+                        continue;
+
+                    result.Add(head);
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Warn("[BIGInventoryScan] failed: hauler=" + Plugin.SafeName(hauler) + " error=" + ex.Message);
+            }
+
+            return result;
+        }
+
+        private static string InventoryCargoKey(CondOwner item)
+        {
+            var head = StackHead(item);
+            var itemDef = SafeItemDef(head);
+            if (!string.IsNullOrEmpty(itemDef))
+                return "item:" + itemDef;
+
+            var coDef = SafeDef(head);
+            if (!string.IsNullOrEmpty(coDef))
+                return "co:" + coDef;
+
+            var name = Plugin.SafeName(head);
+            return !string.IsNullOrEmpty(name) && name != "<null>" ? "name:" + name : null;
+        }
+
+        private static string SafeItemDef(CondOwner co)
+        {
+            try
+            {
+                return co != null ? co.strItemDef : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static int StackCountSafe(CondOwner item)
+        {
+            try
+            {
+                return item != null && item.StackCount > 0 ? item.StackCount : 1;
+            }
+            catch
+            {
+                return 1;
+            }
+        }
+
+        private static void AddCount(Dictionary<string, int> counts, string key, int amount)
+        {
+            if (counts == null || string.IsNullOrEmpty(key))
+                return;
+
+            if (amount < 1)
+                amount = 1;
+
+            int existing;
+            counts.TryGetValue(key, out existing);
+            counts[key] = existing + amount;
+        }
+
+        private static int CountFor(Dictionary<string, int> counts, string key)
+        {
+            if (counts == null || string.IsNullOrEmpty(key))
+                return 0;
+
+            int count;
+            return counts.TryGetValue(key, out count) ? count : 0;
+        }
+
+        private static string CountSummary(Dictionary<string, int> counts)
+        {
+            if (counts == null || counts.Count == 0)
+                return "<empty>";
+
+            var parts = counts
+                .OrderBy(pair => pair.Key)
+                .Take(8)
+                .Select(pair => pair.Key + "=" + pair.Value)
+                .ToList();
+
+            if (counts.Count > parts.Count)
+                parts.Add("+" + (counts.Count - parts.Count) + " more");
+
+            return string.Join(", ", parts.ToArray());
+        }
+
+        private static void SafeClearQueue(CondOwner hauler, string reason)
+        {
+            try
+            {
+                if (hauler?.aQueue == null || hauler.aQueue.Count == 0)
+                    return;
+
+                Plugin.Warn("[BIGQueueClear] reason=" + reason + " hauler=" + Plugin.SafeName(hauler) + " oldQueue=" + Plugin.QueueSummary(hauler) + ".");
+                foreach (var interaction in hauler.aQueue.ToList())
+                    hauler.ClearInteraction(interaction, true);
+
+                if (hauler.aQueue.Count > 0)
+                    hauler.aQueue.Clear();
+            }
+            catch (Exception ex)
+            {
+                Plugin.Warn("[BIGQueueClear] failed: " + ex.Message);
+            }
+        }
+
+        private static void CompleteSession(CondOwner hauler, BigLooseHaulSession session, string reason)
+        {
+            ActiveSessions.Remove(session.HaulerId);
+            Plugin.ModInfo("[BIGStageDone] hauler=" + Plugin.SafeName(hauler) + " reason=" + reason + " duration=" + (DateTime.Now - session.StartedAt).TotalSeconds.ToString("0.0") + "s.");
+        }
+
+        private static int ScoreDrop(CondOwner hauler, Vector3 pos, int baseScore)
+        {
+            if (hauler?.tf == null)
+                return baseScore;
+
+            return baseScore + Mathf.RoundToInt((hauler.tf.position - pos).sqrMagnitude);
+        }
+
+        private static int ScoreDropAnchor(BigLooseHaulSession session, Vector3 pos)
+        {
+            if (session == null || session.DropAnchorShip == null || session.DropAnchorZone == null)
+                return 1000;
+
+            return ScoreSpiralFromAnchor(session.DropAnchorPosition, pos);
+        }
+
+        private static int ScoreDropSpiral(CondOwner hauler, Vector3 anchor, Vector3 pos, int baseScore)
+        {
+            var score = baseScore + ScoreSpiralFromAnchor(anchor, pos);
+            if (hauler?.tf != null)
+                score += Mathf.RoundToInt((hauler.tf.position - pos).sqrMagnitude);
+
             return score;
         }
 
-        private static bool IsBetterPickupScore(PickupSortScore candidate, PickupSortScore currentBest)
+        private static int ScoreSpiralFromAnchor(Vector3 anchor, Vector3 pos)
         {
-            if (candidate.UsedPath != currentBest.UsedPath)
-                return candidate.UsedPath;
+            var dx = Mathf.RoundToInt(pos.x - anchor.x);
+            var dy = Mathf.RoundToInt(pos.y - anchor.y);
+            var ring = Math.Max(Math.Abs(dx), Math.Abs(dy));
+            if (ring == 0)
+                return 0;
 
-            if (candidate.Cost < currentBest.Cost)
-                return true;
+            var side = ring * 2;
+            int ordinal;
+            if (dy == -ring)
+                ordinal = dx + ring;
+            else if (dx == ring)
+                ordinal = side + dy + ring;
+            else if (dy == ring)
+                ordinal = side * 2 + ring - dx;
+            else
+                ordinal = side * 3 + ring - dy;
 
-            if (candidate.Cost > currentBest.Cost)
-                return false;
-
-            if (candidate.SameRoom != currentBest.SameRoom)
-                return candidate.SameRoom;
-
-            if (candidate.TileRange != currentBest.TileRange)
-                return candidate.TileRange < currentBest.TileRange;
-
-            return candidate.OriginalIndex < currentBest.OriginalIndex;
+            return ring * 10000 + ordinal;
         }
 
-        private static bool TryGetPathCost(CondOwner hauler, Tile currentTile, Tile targetTile, CondOwner item, Interaction pickup, out float cost)
+        private static float PickupSortScore(CondOwner hauler, CondOwner item, Interaction pickup)
+        {
+            if (hauler == null || item == null)
+                return float.MaxValue;
+
+            var score = IsSameShip(hauler, item) ? 0f : OffShipPickupPenalty;
+
+            float pathCost;
+            if (TryGetPickupPathCost(hauler, item, pickup, out pathCost))
+                return score + pathCost;
+
+            return float.MaxValue;
+        }
+
+        private static bool TryGetPickupPathCost(CondOwner hauler, CondOwner item, Interaction pickup, out float cost)
         {
             cost = float.MaxValue;
-            if (hauler == null || currentTile == null || targetTile == null)
-                return false;
 
-            if (currentTile == targetTile)
-            {
-                cost = 0f;
-                return true;
-            }
+            if (hauler == null || item == null || hauler.ship == null)
+                return false;
 
             var pathfinder = hauler.Pathfinder;
             if (pathfinder == null)
@@ -1894,1578 +4137,684 @@ namespace OstranautsHaulingV2
 
             try
             {
-                var allowAirlocks = hauler.HasAirlockPermission(false);
-                if (pathfinder.tilCurrent == currentTile)
+                var targetPos = item.GetPos("use");
+                var targetTile = hauler.ship.GetTileAtWorldCoords1(targetPos.x, targetPos.y, true);
+
+                if (targetTile == null)
+                    return false;
+
+                var currentTile = pathfinder.tilCurrent;
+                if (currentTile == null && hauler.tf != null)
+                    currentTile = hauler.ship.GetTileAtWorldCoords1(hauler.tf.position.x, hauler.tf.position.y, true);
+
+                if (currentTile != null && currentTile == targetTile)
                 {
-                    var range = pickup == null ? 1f : Math.Max(0f, pickup.fTargetPointRange);
-                    var result = pathfinder.CheckGoal(targetTile, range, item, allowAirlocks);
-                    if (result != null && result.HasPath && result.PathLength >= 0f)
-                    {
-                        cost = result.PathLength;
-                        return true;
-                    }
+                    cost = 0f;
+                    return true;
                 }
 
-                var path = GetPathToWalkableOriginMethod?.Invoke(pathfinder, new object[] { currentTile, targetTile }) as List<Tile>;
-                if (path != null && path.Count > 0)
+                pathfinder.ResetMemory();
+                var range = pickup == null ? 1f : Math.Max(0f, pickup.fTargetPointRange);
+                var allowAirlocks = hauler.HasAirlockPermission(pickup != null && pickup.bManual);
+                var result = pathfinder.SetGoal2(targetTile, range, item, 0f, 0f, allowAirlocks);
+                if (result != null && result.HasPath && result.PathLength >= 0f)
                 {
-                    cost = path.Count;
+                    cost = result.PathLength;
                     return true;
                 }
             }
-            catch
+            catch (Exception ex)
             {
+                Plugin.Warn("[BIGPickupPath] failed: hauler=" + Plugin.SafeName(hauler) + " item=" + Plugin.Describe(item) + " error=" + ex.Message);
+            }
+            finally
+            {
+                try
+                {
+                    pathfinder.ResetMemory();
+                }
+                catch
+                {
+                }
             }
 
             return false;
         }
 
-        private static Tile GetCurrentTile(CondOwner hauler)
+        private static bool IsSameShip(CondOwner hauler, CondOwner item)
         {
             try
             {
-                if (hauler?.Pathfinder?.tilCurrent != null)
-                    return hauler.Pathfinder.tilCurrent;
-
-                if (hauler?.ship != null && hauler.tf != null)
-                    return hauler.ship.GetTileAtWorldCoords1(hauler.tf.position.x, hauler.tf.position.y, true, true);
+                return hauler != null
+                    && item != null
+                    && hauler.ship != null
+                    && item.ship != null
+                    && string.Equals(hauler.ship.strRegID, item.ship.strRegID, StringComparison.Ordinal);
             }
             catch
-            {
-            }
-
-            return null;
-        }
-
-        private static Tile GetPickupTile(CondOwner hauler, HaulChain chain)
-        {
-            if (hauler?.ship == null || chain?.Item == null)
-                return null;
-
-            try
-            {
-                var targetPoint = chain.Pickup?.strTargetPoint;
-                if (string.IsNullOrEmpty(targetPoint) || string.Equals(targetPoint, "remote", StringComparison.OrdinalIgnoreCase))
-                    targetPoint = "use";
-
-                var pos = chain.Item.GetPos(targetPoint);
-                return hauler.ship.GetTileAtWorldCoords1(pos.x, pos.y, true, true);
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        private static bool SameRoom(Tile a, Tile b)
-        {
-            return a?.room != null && b?.room != null && a.room == b.room;
-        }
-
-        private static int TileRangeSafe(Tile a, Tile b)
-        {
-            try
-            {
-                if (a != null && b != null)
-                    return Math.Max(0, TileUtils.TileRange(a, b));
-            }
-            catch
-            {
-            }
-
-            return int.MaxValue;
-        }
-
-        private static float FallbackDistanceSq(CondOwner hauler, Tile currentTile, PickupSortTarget target)
-        {
-            try
-            {
-                var pa = currentTile?.tf?.position ?? hauler.tf.position;
-                var pb = target?.Tile?.tf?.position ?? target?.Chain?.Item?.tf?.position ?? pa;
-                var dx = pa.x - pb.x;
-                var dy = pa.y - pb.y;
-                return dx * dx + dy * dy;
-            }
-            catch
-            {
-                return float.MaxValue;
-            }
-        }
-
-        private static string PickupOrderSummary(List<PickupSortTarget> targets, int max)
-        {
-            if (targets == null || targets.Count == 0)
-                return "<none>";
-
-            var sb = new StringBuilder();
-            var count = Math.Min(targets.Count, max);
-            for (var i = 0; i < count; i++)
-            {
-                if (i > 0)
-                    sb.Append(" | ");
-
-                var target = targets[i];
-                sb.Append(i)
-                    .Append(":")
-                    .Append(SafeCO(target?.Chain?.Item))
-                    .Append("@tile=")
-                    .Append(target?.Tile?.Index.ToString() ?? "?")
-                    .Append("/orig=")
-                    .Append(target?.OriginalIndex.ToString() ?? "?");
-            }
-
-            if (targets.Count > count)
-                sb.Append(" | ...");
-
-            return sb.ToString();
-        }
-
-        private static void CompactLeadingHaulChains(CondOwner hauler, HaulChain utilityDragChain, List<HaulChain> chains)
-        {
-            var queue = hauler.aQueue;
-            var consumed = ((chains?.Count ?? 0) + (utilityDragChain == null ? 0 : 1)) * 3;
-            var tail = new List<Interaction>();
-            for (var i = consumed; i < queue.Count; i++)
-                tail.Add(queue[i]);
-
-            queue.Clear();
-
-            if (utilityDragChain != null)
-                queue.Add(utilityDragChain.Pickup);
-
-            foreach (var chain in chains)
-                queue.Add(chain.Pickup);
-
-            foreach (var chain in chains)
-            {
-                if (queue.Count == 0 || queue[queue.Count - 1].objThem != chain.Walk.objThem)
-                    queue.Add(chain.Walk);
-
-                queue.Add(chain.Drop);
-            }
-
-            if (utilityDragChain != null)
-            {
-                if (queue.Count == 0 || queue[queue.Count - 1].objThem != utilityDragChain.Walk.objThem)
-                    queue.Add(utilityDragChain.Walk);
-
-                queue.Add(utilityDragChain.Drop);
-            }
-
-            queue.AddRange(tail);
-        }
-
-        private static bool TryReadHaulChain(List<Interaction> queue, int index, out HaulChain chain)
-        {
-            chain = null;
-            if (queue == null || queue.Count <= index + 2)
-                return false;
-
-            var pickup = queue[index];
-            var walk = queue[index + 1];
-            var drop = queue[index + 2];
-
-            if (!IsNamed(pickup, "PickupItemStack")
-                || !IsNamed(walk, "Walk")
-                || !IsNamed(drop, "DropItemStack")
-                || pickup.objThem == null
-                || walk.objThem == null
-                || drop.objThem != pickup.objThem)
             {
                 return false;
             }
-
-            chain = new HaulChain(pickup.objThem, pickup, walk, drop);
-            return true;
         }
 
-        private static bool IsHaulTask(Task2 task)
+        private static void EnsureDropAnchor(BigLooseHaulSession session, DropPlan plan)
         {
-            return task != null
-                && string.Equals(task.strDuty, "Haul", StringComparison.OrdinalIgnoreCase)
-                && string.Equals(task.strInteraction, "ACTHaulItem", StringComparison.OrdinalIgnoreCase);
+            if (session == null || plan == null || plan.TargetShip == null || plan.Zone == null)
+                return;
+
+            if (session.DropAnchorShip != null && session.DropAnchorZone != null)
+                return;
+
+            Vector3 anchor;
+            if (!TryGetZoneSpiralAnchor(plan.TargetShip, plan.Zone, out anchor))
+                anchor = plan.DropPosition;
+
+            session.DropAnchorShip = plan.TargetShip;
+            session.DropAnchorZone = plan.Zone;
+            session.DropAnchorPosition = anchor;
+            Plugin.ModInfo("[BIGDropPhase] hauler=" + session.HaulerName
+                + " state=anchor ship=" + plan.TargetShip.strRegID
+                + " zone=" + plan.Zone.strName
+                + " anchor=(" + anchor.x.ToString("0.00") + "," + anchor.y.ToString("0.00") + ")"
+                + " first=(" + plan.DropPosition.x.ToString("0.00") + "," + plan.DropPosition.y.ToString("0.00") + ").");
         }
 
-        private static bool IsNamed(Interaction interaction, string name)
+        private static CondOwner StackHead(CondOwner item)
         {
-            return interaction != null && string.Equals(interaction.strName, name, StringComparison.OrdinalIgnoreCase);
+            return item != null && item.coStackHead != null ? item.coStackHead : item;
         }
 
-        private static string GetDestinationShipID(HaulChain chain)
+        private static string SafeDef(CondOwner co)
         {
-            return chain?.Walk?.objThem?.ship?.strRegID;
-        }
-
-        private static string QueueSummary(CondOwner hauler)
-        {
-            if (hauler?.aQueue == null)
-                return "<null>";
-
-            var sb = new StringBuilder();
-            sb.Append("count=").Append(hauler.aQueue.Count).Append(" [");
-            var max = Math.Min(hauler.aQueue.Count, 20);
-            for (var i = 0; i < max; i++)
+            try
             {
-                if (i > 0)
-                    sb.Append("; ");
+                return co != null ? co.strCODef : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
 
-                var interaction = hauler.aQueue[i];
-                sb.Append(i).Append(":");
-                sb.Append(interaction?.strName ?? "?");
-                sb.Append("->");
-                sb.Append(SafeCO(interaction?.objThem));
+        private static bool ContainsSame(List<CondOwner> list, CondOwner item)
+        {
+            var id = SafeId(item);
+            return !string.IsNullOrEmpty(id) && list.Any(existing => SafeId(existing) == id);
+        }
+
+        private static void RemoveSame(List<CondOwner> list, CondOwner item)
+        {
+            var id = SafeId(item);
+            if (string.IsNullOrEmpty(id))
+                return;
+
+            list.RemoveAll(existing => SafeId(existing) == id);
+        }
+
+        private static void CountFailedAttempt(BigLooseHaulSession session, CondOwner item)
+        {
+            var id = SafeId(item);
+            if (string.IsNullOrEmpty(id))
+                return;
+
+            int count;
+            session.FailedPickupAttempts.TryGetValue(id, out count);
+            session.FailedPickupAttempts[id] = count + 1;
+        }
+
+        private static int GetFailedAttempts(BigLooseHaulSession session, CondOwner item)
+        {
+            var id = SafeId(item);
+            if (string.IsNullOrEmpty(id))
+                return 0;
+
+            int count;
+            return session.FailedPickupAttempts.TryGetValue(id, out count) ? count : 0;
+        }
+
+        private static string SafeId(CondOwner co)
+        {
+            try
+            {
+                return co?.strID;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+    }
+
+    internal sealed class BigLooseHaulSession
+    {
+        internal string HaulerId;
+        internal string HaulerName;
+        internal BigHaulPaintMode Mode = BigHaulPaintMode.Haul;
+        internal List<CondOwner> Pending = new List<CondOwner>();
+        internal List<CondOwner> Backlog = new List<CondOwner>();
+        internal List<CondOwner> Carried = new List<CondOwner>();
+        internal CondOwner CurrentPickup;
+        internal DropPlan CurrentDrop;
+        internal DateTime StartedAt;
+        internal bool AutoPausedLogged;
+        internal bool DropPhase;
+        internal Ship DropAnchorShip;
+        internal JsonZone DropAnchorZone;
+        internal Vector3 DropAnchorPosition;
+        internal Dictionary<string, int> FailedPickupAttempts = new Dictionary<string, int>();
+        internal bool InventoryBaselineCaptured;
+        internal Dictionary<string, int> BaselineInventoryCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+        internal HashSet<string> BaselineInventoryIds = new HashSet<string>(StringComparer.Ordinal);
+        internal HashSet<string> SessionCargoKeys = new HashSet<string>(StringComparer.Ordinal);
+        internal HashSet<string> BaselineMergeWarnings = new HashSet<string>(StringComparer.Ordinal);
+    }
+
+    internal sealed class DropPlan
+    {
+        internal CondOwner Item;
+        internal Ship TargetShip;
+        internal JsonZone Zone;
+        internal CondOwner StackTarget;
+        internal CondOwner WalkTarget;
+        internal Vector3 DropPosition;
+        internal int Score;
+        internal string Summary;
+    }
+
+    internal static class BigHaulRegistry
+    {
+        private static readonly Dictionary<string, BigHaulRecord> Records = new Dictionary<string, BigHaulRecord>();
+
+        internal static BigHaulRecord Register(CondOwner hauler, CondOwner item, BigHaulPaintMode mode)
+        {
+            var itemId = item.strID ?? Guid.NewGuid().ToString("N");
+            BigHaulRecord record;
+
+            if (!Records.TryGetValue(itemId, out record))
+            {
+                record = new BigHaulRecord();
+                Records[itemId] = record;
             }
 
-            if (hauler.aQueue.Count > max)
-                sb.Append("; ...");
+            record.ItemId = itemId;
+            record.ItemName = Plugin.SafeName(item);
+            record.ItemDef = Safe(() => item.strItemDef);
+            record.ShipId = Safe(() => item.ship != null ? item.ship.strRegID : null);
+            record.Tile = Plugin.SafeTile(item);
+            record.Mode = mode.ToString();
+            record.State = "Pending";
+            record.ClaimedBy = null;
+            record.RegisteredBy = Plugin.SafeName(hauler);
+            record.RegisteredAt = DateTime.Now;
 
-            sb.Append("]");
-            return sb.ToString();
+            return record;
         }
 
-        private static string DescribeItem(CondOwner item)
+        internal static void EnsureIcon(BigHaulRecord record, CondOwner item)
         {
-            if (item == null)
-                return "<null>";
+            if (record == null || item == null || item.gameObject == null)
+                return;
 
-            return SafeCO(item)
-                + " def=" + (item.strCODef ?? "?")
-                + " stack=" + item.StackCount + "/" + item.nStackLimit
-                + " parent=" + SafeCO(item.objCOParent)
-                + " slot=" + (item.slotNow?.strName ?? "<none>")
-                + " carried=" + item.HasCond("IsCarried")
-                + " installed=" + item.HasCond("IsInstalled");
-        }
-
-        private static string DescribeTile(Tile tile)
-        {
-            if (tile == null)
-                return "<null>";
-
-            return (tile.coProps?.ship?.strRegID ?? tile.coProps?.strID ?? "?") + "#" + tile.Index;
-        }
-
-        private static string StackKey(CondOwner item)
-        {
-            return item?.strCODef
-                ?? item?.strItemDef
-                ?? item?.strName
-                ?? item?.strNameFriendly
-                ?? item?.strID
-                ?? "";
-        }
-
-        private static string SafeCO(CondOwner co)
-        {
-            if (co == null)
-                return "<null>";
-
-            var name = string.IsNullOrEmpty(co.strNameFriendly) ? co.strName : co.strNameFriendly;
-            return (co.strID ?? "?") + "/" + (name ?? "?");
-        }
-
-        private sealed class DropDestinationPlanner
-        {
-            private readonly CondOwner _hauler;
-            private readonly Dictionary<string, int> _reservedStackCounts = new Dictionary<string, int>();
-            private readonly Dictionary<string, List<PlannedStack>> _plannedStacks = new Dictionary<string, List<PlannedStack>>();
-            private readonly HashSet<string> _reservedNewTileKeys = new HashSet<string>();
-
-            internal DropDestinationPlanner(CondOwner hauler)
+            try
             {
-                _hauler = hauler;
+                var workManager = CrewSim.objInstance?.workManager;
+                if (workManager == null)
+                    return;
+
+                GameObject sign;
+                if (record.Icon != null)
+                    sign = workManager.AttachSignToObject(record.Icon, item.gameObject, Plugin.BigHaulMarkerIcon);
+                else
+                    sign = workManager.ActivateSignFromPool(item.gameObject, Plugin.BigHaulMarkerIcon);
+
+                if (sign == null)
+                    return;
+
+                var renderer = sign.GetComponent<MeshRenderer>();
+                if (renderer != null)
+                    renderer.enabled = true;
+
+                record.Icon = sign;
+                record.IconAttached = true;
+                Plugin.ModInfo("BIG icon attached: " + record);
             }
-
-            internal bool TryRetargetExistingChain(HaulChain chain, out string reason)
+            catch (Exception ex)
             {
-                reason = "other";
-                if (chain?.Walk == null || chain.Item == null)
-                {
-                    reason = "no-chain";
-                    return false;
-                }
-
-                if (!TryChooseDestination(chain.Item, out var tile, out reason))
-                    return false;
-
-                ApplyWalkDestination(chain.Walk, tile);
-                Plugin.ModInfo("[V2DropPlan] hauler=" + SafeCO(_hauler)
-                    + " reason=" + reason + "/primary"
-                    + " dest=" + DescribeTile(tile)
-                    + " item={" + DescribeItem(chain.Item) + "}");
-                return true;
+                Plugin.Warn("BIG icon attach failed: " + record + " error=" + ex.Message);
             }
+        }
 
-            internal bool TryResolveForTask(Task2 task, CondOwner item, out Tile tile, out string reason)
+        internal static void RefreshOwnedIcons()
+        {
+            if (Records.Count == 0)
+                return;
+
+            foreach (var record in Records.Values.ToList())
             {
-                tile = null;
-                reason = "other";
-                if (task == null || item == null)
-                {
-                    reason = "null";
-                    return false;
-                }
+                if (record == null || string.IsNullOrEmpty(record.ItemId) || record.State != "Pending")
+                    continue;
 
-                if (!TryChooseDestination(item, out tile, out reason))
-                    return false;
-
-                ApplyTaskDestination(task, tile);
-                return true;
-            }
-
-            private bool TryChooseDestination(CondOwner item, out Tile tile, out string reason)
-            {
-                tile = null;
-                reason = "other";
-                if (_hauler == null || item == null || item.Item == null)
-                {
-                    reason = "null";
-                    return false;
-                }
-
-                var zones = GetCompatibleZones(item, out reason);
-                if (zones.Count == 0)
-                    return false;
-
-                var candidates = new List<DropCandidate>();
-                AddPlannedStackCandidates(item, zones, candidates);
-
-                foreach (var zone in zones)
-                {
-                    AddExistingStackCandidates(item, zone, candidates);
-                    AddEmptyFitCandidate(item, zone, candidates);
-                }
-
-                if (candidates.Count == 0)
-                {
-                    reason = "no-custom-drop-candidate";
-                    return false;
-                }
-
-                candidates.Sort(CompareDropCandidates);
-                var selected = candidates[0];
-                Reserve(selected, item);
-
-                tile = selected.Tile;
-                reason = selected.Reason;
-                return tile != null;
-            }
-
-            private List<DropZone> GetCompatibleZones(CondOwner item, out string reason)
-            {
-                reason = "other";
-                var result = new List<DropZone>();
-                if (_hauler?.ship == null || item == null)
-                {
-                    reason = "null";
-                    return result;
-                }
-
-                List<JsonZone> zones;
                 try
                 {
-                    zones = _hauler.ship.GetZones("IsZoneStockpile", _hauler, bAllowDocked: true);
-                    zones?.Sort();
+                    CondOwner item;
+                    if (DataHandler.mapCOs != null && DataHandler.mapCOs.TryGetValue(record.ItemId, out item) && item != null)
+                    {
+                        if (HasCond(item, "IsCarried"))
+                        {
+                            record.State = "PickedUp";
+                            ClearIcon(record, "picked-up");
+                            continue;
+                        }
+
+                        if (record.Icon == null || !IsIconVisible(record.Icon))
+                            EnsureIcon(record, item);
+
+                        continue;
+                    }
+
+                    ClearIcon(record, "target-not-loaded");
                 }
                 catch (Exception ex)
                 {
-                    reason = "get-zones-" + ex.GetType().Name;
-                    return result;
+                    Plugin.Warn("BIG icon refresh failed: " + record + " error=" + ex.Message);
                 }
-
-                if (zones == null || zones.Count == 0)
-                {
-                    reason = "no-stockpile-zones";
-                    return result;
-                }
-
-                var validHaulDest = DataHandler.GetCondTrigger("TIsValidHaulDest");
-                for (var i = 0; i < zones.Count; i++)
-                {
-                    var zone = zones[i];
-                    if (zone == null || !ZoneAcceptsItem(zone, item))
-                        continue;
-
-                    if (string.IsNullOrEmpty(zone.strRegID) || !CrewSim.system.dictShips.TryGetValue(zone.strRegID, out var ship) || ship == null)
-                        continue;
-
-                    var zoneInfo = new DropZone
-                    {
-                        Zone = zone,
-                        Ship = ship,
-                        OriginalIndex = i,
-                        ZoneName = zone.strName ?? "?",
-                        ZoneKey = (zone.strRegID ?? "?") + ":" + (zone.strName ?? i.ToString()),
-                        TileCount = zone.aTiles?.Length ?? 0
-                    };
-
-                    zoneInfo.Objects = GetZoneObjects(ship, zone, validHaulDest);
-                    zoneInfo.ObjectCount = zoneInfo.Objects.Count;
-                    zoneInfo.ReservedNewTiles = CountReservedTiles(ship, zone);
-                    zoneInfo.FreeScore = Math.Max(0, zoneInfo.TileCount - zoneInfo.ObjectCount - zoneInfo.ReservedNewTiles);
-                    zoneInfo.CanFitEmpty = TryFindEmptyFit(item, zoneInfo, out zoneInfo.EmptyTile);
-
-                    result.Add(zoneInfo);
-                }
-
-                reason = result.Count == 0 ? "no-compatible-zones" : "";
-                return result;
-            }
-
-            private void AddExistingStackCandidates(CondOwner item, DropZone zone, List<DropCandidate> candidates)
-            {
-                if (zone?.Objects == null || candidates == null)
-                    return;
-
-                var needed = Math.Max(1, item?.StackCount ?? 1);
-                var seenStacks = new HashSet<string>();
-                foreach (var obj in zone.Objects)
-                {
-                    var stack = obj?.coStackHead ?? obj;
-                    if (stack == null || string.IsNullOrEmpty(stack.strID) || !seenStacks.Add(stack.strID))
-                        continue;
-
-                    var capacity = SafeStackCapacity(stack, item) - GetReservedStackCount(stack);
-                    if (capacity < needed)
-                        continue;
-
-                    var stackTile = GetTileForCO(zone.Ship, stack);
-                    if (stackTile?.coProps == null)
-                        continue;
-
-                    var score = zone.CanFitEmpty ? 300000 : 120000;
-                    score += Math.Min(zone.FreeScore, 5000) * 50;
-                    score += Math.Min(Math.Max(0, stack.StackCount), 1000) * 5;
-                    score += Math.Min(capacity, 1000) * 2;
-
-                    candidates.Add(new DropCandidate
-                    {
-                        Tile = stackTile,
-                        Score = score,
-                        Distance = TileRangeSafe(GetCurrentTile(_hauler), stackTile),
-                        OriginalZoneIndex = zone.OriginalIndex,
-                        Reason = "existing-stack zone=" + zone.ZoneName
-                            + " cap=" + capacity
-                            + " free=" + zone.FreeScore
-                            + " crowded=" + (!zone.CanFitEmpty),
-                        ExistingStack = stack
-                    });
-                }
-            }
-
-            private void AddPlannedStackCandidates(CondOwner item, List<DropZone> zones, List<DropCandidate> candidates)
-            {
-                if (item == null || candidates == null || item.nStackLimit <= 1)
-                    return;
-
-                var key = StackKey(item);
-                if (string.IsNullOrEmpty(key) || !_plannedStacks.TryGetValue(key, out var stacks))
-                    return;
-
-                var needed = Math.Max(1, item.StackCount);
-                foreach (var planned in stacks)
-                {
-                    if (planned == null || planned.FreeCapacity < needed || planned.Tile?.coProps == null)
-                        continue;
-
-                    var zone = zones.FirstOrDefault(z => z.ZoneKey == planned.ZoneKey);
-                    var free = zone?.FreeScore ?? 0;
-                    var score = 280000 + Math.Min(free, 5000) * 50 + Math.Min(planned.FreeCapacity, 1000) * 2;
-                    candidates.Add(new DropCandidate
-                    {
-                        Tile = planned.Tile,
-                        Score = score,
-                        Distance = TileRangeSafe(GetCurrentTile(_hauler), planned.Tile),
-                        OriginalZoneIndex = zone?.OriginalIndex ?? int.MaxValue,
-                        Reason = "planned-stack zone=" + (zone?.ZoneName ?? planned.ZoneKey)
-                            + " cap=" + planned.FreeCapacity
-                            + " free=" + free,
-                        PlannedStack = planned
-                    });
-                }
-            }
-
-            private void AddEmptyFitCandidate(CondOwner item, DropZone zone, List<DropCandidate> candidates)
-            {
-                if (zone?.EmptyTile?.coProps == null || candidates == null)
-                    return;
-
-                var score = 200000 + Math.Min(zone.FreeScore, 5000) * 50;
-                candidates.Add(new DropCandidate
-                {
-                    Tile = zone.EmptyTile,
-                    Score = score,
-                    Distance = TileRangeSafe(GetCurrentTile(_hauler), zone.EmptyTile),
-                    OriginalZoneIndex = zone.OriginalIndex,
-                    Reason = "empty-fit zone=" + zone.ZoneName
-                        + " free=" + zone.FreeScore
-                        + " tiles=" + zone.TileCount
-                        + " objects=" + zone.ObjectCount
-                });
-            }
-
-            private void Reserve(DropCandidate candidate, CondOwner item)
-            {
-                if (candidate == null || item == null)
-                    return;
-
-                var count = Math.Max(1, item.StackCount);
-                if (candidate.ExistingStack != null && !string.IsNullOrEmpty(candidate.ExistingStack.strID))
-                {
-                    _reservedStackCounts.TryGetValue(candidate.ExistingStack.strID, out var reserved);
-                    _reservedStackCounts[candidate.ExistingStack.strID] = reserved + count;
-                    return;
-                }
-
-                if (candidate.PlannedStack != null)
-                {
-                    candidate.PlannedStack.Reserved += count;
-                    return;
-                }
-
-                if (candidate.Tile == null)
-                    return;
-
-                _reservedNewTileKeys.Add(TileKey(candidate.Tile));
-
-                if (item.nStackLimit <= 1)
-                    return;
-
-                var key = StackKey(item);
-                if (string.IsNullOrEmpty(key))
-                    return;
-
-                if (!_plannedStacks.TryGetValue(key, out var stacks))
-                {
-                    stacks = new List<PlannedStack>();
-                    _plannedStacks[key] = stacks;
-                }
-
-                stacks.Add(new PlannedStack
-                {
-                    Tile = candidate.Tile,
-                    ZoneKey = FindZoneKey(candidate.Tile),
-                    StackLimit = Math.Max(1, item.nStackLimit),
-                    Reserved = count
-                });
-            }
-
-            private static int CompareDropCandidates(DropCandidate a, DropCandidate b)
-            {
-                if (a == null && b == null)
-                    return 0;
-                if (a == null)
-                    return 1;
-                if (b == null)
-                    return -1;
-
-                var score = b.Score.CompareTo(a.Score);
-                if (score != 0)
-                    return score;
-
-                var distance = a.Distance.CompareTo(b.Distance);
-                if (distance != 0)
-                    return distance;
-
-                var zone = a.OriginalZoneIndex.CompareTo(b.OriginalZoneIndex);
-                if (zone != 0)
-                    return zone;
-
-                return (a.Tile?.Index ?? int.MaxValue).CompareTo(b.Tile?.Index ?? int.MaxValue);
-            }
-
-            private static void ApplyTaskDestination(Task2 task, Tile tile)
-            {
-                if (task == null || tile?.coProps?.ship == null)
-                    return;
-
-                task.nTile = tile.Index;
-                task.strTileShip = tile.coProps.ship.strRegID;
-            }
-
-            private static void ApplyWalkDestination(Interaction walk, Tile tile)
-            {
-                if (walk == null || tile?.coProps == null)
-                    return;
-
-                walk.objThem = tile.coProps;
-                walk.strTargetPoint = "use";
-                walk.fTargetPointRange = 0f;
-            }
-
-            private static bool ZoneAcceptsItem(JsonZone zone, CondOwner item)
-            {
-                try
-                {
-                    if (zone?.categoryConds == null || zone.categoryConds.Length == 0)
-                        return true;
-
-                    foreach (var cond in zone.categoryConds)
-                    {
-                        if (!string.IsNullOrEmpty(cond) && item.HasCond(cond))
-                            return true;
-                    }
-                }
-                catch
-                {
-                }
-
-                return false;
-            }
-
-            private static List<CondOwner> GetZoneObjects(Ship ship, JsonZone zone, CondTrigger validHaulDest)
-            {
-                try
-                {
-                    if (ship == null || zone == null || validHaulDest == null)
-                        return new List<CondOwner>();
-
-                    return ship.GetCOsInZone(zone, validHaulDest, bAllowLocked: false) ?? new List<CondOwner>();
-                }
-                catch
-                {
-                    return new List<CondOwner>();
-                }
-            }
-
-            private bool TryFindEmptyFit(CondOwner item, DropZone zoneInfo, out Tile tile)
-            {
-                tile = null;
-                if (item?.Item == null || zoneInfo?.Ship == null || zoneInfo.Zone?.aTiles == null || zoneInfo.Zone.aTiles.Length == 0)
-                    return false;
-
-                var originalTiles = zoneInfo.Zone.aTiles;
-                var filteredTiles = originalTiles
-                    .Where(t => !_reservedNewTileKeys.Contains(TileKey(zoneInfo.Ship, t)))
-                    .ToArray();
-
-                if (filteredTiles.Length == 0)
-                    return false;
-
-                try
-                {
-                    zoneInfo.Zone.aTiles = filteredTiles;
-                    var vFits = default(UnityEngine.Vector3);
-                    if (!TileUtils.TryFitItem(item.Item, zoneInfo.Ship, zoneInfo.Zone, out vFits))
-                        return false;
-
-                    tile = zoneInfo.Ship.GetTileAtWorldCoords1(vFits.x, vFits.y, bAllowDocked: true);
-                    return tile?.coProps != null && !_reservedNewTileKeys.Contains(TileKey(tile));
-                }
-                catch
-                {
-                    tile = null;
-                    return false;
-                }
-                finally
-                {
-                    zoneInfo.Zone.aTiles = originalTiles;
-                }
-            }
-
-            private static Tile GetTileForCO(Ship ship, CondOwner co)
-            {
-                try
-                {
-                    if (ship == null || co?.tf == null)
-                        return null;
-
-                    return ship.GetTileAtWorldCoords1(co.tf.position.x, co.tf.position.y, bAllowDocked: true);
-                }
-                catch
-                {
-                    return null;
-                }
-            }
-
-            private static int SafeStackCapacity(CondOwner stack, CondOwner incoming)
-            {
-                try
-                {
-                    return Math.Max(0, stack?.CanStackOnItem(incoming) ?? 0);
-                }
-                catch
-                {
-                    return 0;
-                }
-            }
-
-            private int GetReservedStackCount(CondOwner stack)
-            {
-                if (stack == null || string.IsNullOrEmpty(stack.strID))
-                    return 0;
-
-                _reservedStackCounts.TryGetValue(stack.strID, out var reserved);
-                return reserved;
-            }
-
-            private int CountReservedTiles(Ship ship, JsonZone zone)
-            {
-                if (ship == null || zone?.aTiles == null || _reservedNewTileKeys.Count == 0)
-                    return 0;
-
-                var count = 0;
-                foreach (var tileIndex in zone.aTiles)
-                {
-                    if (_reservedNewTileKeys.Contains(TileKey(ship, tileIndex)))
-                        count++;
-                }
-
-                return count;
-            }
-
-            private string FindZoneKey(Tile tile)
-            {
-                if (tile?.coProps?.ship == null)
-                    return "";
-
-                try
-                {
-                    var ship = tile.coProps.ship;
-                    var zones = _hauler?.ship?.GetZones("IsZoneStockpile", _hauler, bAllowDocked: true);
-                    if (zones == null)
-                        return ship.strRegID ?? "";
-
-                    for (var i = 0; i < zones.Count; i++)
-                    {
-                        var zone = zones[i];
-                        if (zone?.aTiles == null || !string.Equals(zone.strRegID, ship.strRegID, StringComparison.OrdinalIgnoreCase))
-                            continue;
-
-                        if (Array.IndexOf(zone.aTiles, tile.Index) >= 0)
-                            return (zone.strRegID ?? "?") + ":" + (zone.strName ?? i.ToString());
-                    }
-                }
-                catch
-                {
-                }
-
-                return tile.coProps.ship.strRegID ?? "";
-            }
-
-            private static string TileKey(Tile tile)
-            {
-                return tile?.coProps?.ship == null ? "" : TileKey(tile.coProps.ship, tile.Index);
-            }
-
-            private static string TileKey(Ship ship, int tileIndex)
-            {
-                return (ship?.strRegID ?? "?") + ":" + tileIndex;
-            }
-
-            private sealed class DropZone
-            {
-                internal JsonZone Zone;
-                internal Ship Ship;
-                internal List<CondOwner> Objects = new List<CondOwner>();
-                internal Tile EmptyTile;
-                internal string ZoneName;
-                internal string ZoneKey;
-                internal int OriginalIndex;
-                internal int TileCount;
-                internal int ObjectCount;
-                internal int ReservedNewTiles;
-                internal int FreeScore;
-                internal bool CanFitEmpty;
-            }
-
-            private sealed class DropCandidate
-            {
-                internal Tile Tile;
-                internal int Score;
-                internal int Distance;
-                internal int OriginalZoneIndex;
-                internal string Reason;
-                internal CondOwner ExistingStack;
-                internal PlannedStack PlannedStack;
-            }
-
-            private sealed class PlannedStack
-            {
-                internal Tile Tile;
-                internal string ZoneKey;
-                internal int StackLimit;
-                internal int Reserved;
-
-                internal int FreeCapacity => Math.Max(0, StackLimit - Reserved);
             }
         }
 
-        internal sealed class HaulChain
-        {
-            internal HaulChain(CondOwner item, Interaction pickup, Interaction walk, Interaction drop)
-            {
-                Item = item;
-                Pickup = pickup;
-                Walk = walk;
-                Drop = drop;
-            }
-
-            internal CondOwner Item { get; }
-            internal Interaction Pickup { get; }
-            internal Interaction Walk { get; }
-            internal Interaction Drop { get; }
-        }
-
-        private sealed class PickupSortTarget
-        {
-            internal HaulChain Chain;
-            internal Tile Tile;
-            internal int OriginalIndex;
-        }
-
-        private sealed class PickupSortScore
-        {
-            internal bool UsedPath;
-            internal bool SameRoom;
-            internal float Cost;
-            internal int TileRange;
-            internal int OriginalIndex;
-        }
-    }
-
-    internal static class HaulBatchRegistry
-    {
-        private static readonly List<Entry> Entries = new List<Entry>();
-        private static int CompletingTaskDepth;
-
-        internal static void BeginCompleteTask()
-        {
-            CompletingTaskDepth++;
-        }
-
-        internal static void EndCompleteTask()
-        {
-            if (CompletingTaskDepth > 0)
-                CompletingTaskDepth--;
-        }
-
-        internal static void Register(CondOwner hauler, List<VanillaHaulBatcher.HaulChain> chains)
-        {
-            if (hauler?.aQueue == null || chains == null || string.IsNullOrEmpty(hauler.strID))
-                return;
-
-            CleanupHauler(hauler);
-
-            foreach (var chain in chains)
-            {
-                if (chain?.Item == null || string.IsNullOrEmpty(chain.Item.strID))
-                    continue;
-
-                Entries.RemoveAll(e => e.HaulerID == hauler.strID && e.ItemID == chain.Item.strID);
-                Entries.Add(new Entry
-                {
-                    HaulerID = hauler.strID,
-                    ItemID = chain.Item.strID,
-                    Pickup = chain.Pickup,
-                    Walk = chain.Walk,
-                    Drop = chain.Drop
-                });
-            }
-        }
-
-        internal static void CleanupHauler(CondOwner hauler)
-        {
-            if (hauler == null || string.IsNullOrEmpty(hauler.strID))
-                return;
-
-            var queue = hauler.aQueue;
-            Entries.RemoveAll(e =>
-                e.HaulerID == hauler.strID
-                && (queue == null
-                    || (!queue.Contains(e.Pickup) && !queue.Contains(e.Walk) && !queue.Contains(e.Drop))));
-        }
-
-        internal static void HandleRemovedTask(Task2 task)
-        {
-            if (task == null || CompletingTaskDepth > 0 || string.IsNullOrEmpty(task.strTargetCOID))
-                return;
-
-            var removed = 0;
-            for (var i = Entries.Count - 1; i >= 0; i--)
-            {
-                var entry = Entries[i];
-                if (entry.ItemID != task.strTargetCOID)
-                    continue;
-
-                if (!TryGetHauler(entry.HaulerID, out var hauler) || hauler.aQueue == null)
-                {
-                    Entries.RemoveAt(i);
-                    continue;
-                }
-
-                var queue = hauler.aQueue;
-                var pickupQueued = queue.Contains(entry.Pickup);
-                if (pickupQueued)
-                {
-                    queue.Remove(entry.Pickup);
-                    queue.Remove(entry.Drop);
-                    queue.Remove(entry.Walk);
-                    removed++;
-                    Plugin.ModInfo("[V2HaulCancelCleanup] hauler=" + SafeCO(hauler)
-                        + " itemID=" + entry.ItemID
-                        + " removedQueuedPickupDrop=True");
-                }
-
-                Entries.RemoveAt(i);
-            }
-
-            if (removed == 0 && Entries.Count > 512)
-                Entries.RemoveAll(e => !TryGetHauler(e.HaulerID, out var hauler) || hauler.aQueue == null);
-        }
-
-        private static bool TryGetHauler(string haulerID, out CondOwner hauler)
-        {
-            hauler = null;
-            if (string.IsNullOrEmpty(haulerID))
-                return false;
-
-            try
-            {
-                return DataHandler.mapCOs.TryGetValue(haulerID, out hauler) && hauler != null;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        private static string SafeCO(CondOwner co)
-        {
-            if (co == null)
-                return "<null>";
-
-            var name = string.IsNullOrEmpty(co.strNameFriendly) ? co.strName : co.strNameFriendly;
-            return (co.strID ?? "?") + "/" + (name ?? "?");
-        }
-
-        private sealed class Entry
-        {
-            internal string HaulerID;
-            internal string ItemID;
-            internal Interaction Pickup;
-            internal Interaction Walk;
-            internal Interaction Drop;
-        }
-    }
-
-    internal sealed class CarriedContainerPlan
-    {
-        private readonly List<ContainerState> _containers;
-        private readonly HashSet<string> _containerIDs;
-        private readonly string _activeDragContainerID;
-        private readonly string _activeDragContainerLabel;
-        private int _reservedItems;
-
-        private CarriedContainerPlan(List<ContainerCandidate> candidates, bool dragSlotOccupied, CondOwner activeDragContainer)
-        {
-            DragSlotOccupied = dragSlotOccupied;
-            _activeDragContainerID = activeDragContainer?.strID ?? "";
-            _activeDragContainerLabel = VanillaHaulBatcherSafeCO(activeDragContainer);
-            ActiveDragContainer = activeDragContainer;
-            candidates.Sort((a, b) => CompareContainerCandidates(a, b, _activeDragContainerID));
-
-            _containers = new List<ContainerState>();
-            _containerIDs = new HashSet<string>();
-            foreach (var candidate in candidates)
-            {
-                if (candidate?.Owner == null || string.IsNullOrEmpty(candidate.Owner.strID) || !_containerIDs.Add(candidate.Owner.strID))
-                    continue;
-
-                _containers.Add(new ContainerState(candidate.Owner.objContainer, candidate.Source));
-            }
-        }
-
-        internal bool DragSlotOccupied { get; }
-
-        internal bool HasActiveDragContainer
-        {
-            get { return !string.IsNullOrEmpty(_activeDragContainerID) && _containerIDs.Contains(_activeDragContainerID); }
-        }
-
-        internal string ActiveDragContainerDescription
-        {
-            get { return HasActiveDragContainer ? _activeDragContainerLabel : "<none>"; }
-        }
-
-        internal CondOwner ActiveDragContainer { get; }
-
-        internal string Description
-        {
-            get
-            {
-                var sb = new StringBuilder();
-                sb.Append("containers=").Append(_containers.Count)
-                    .Append(" dragOccupied=").Append(DragSlotOccupied)
-                    .Append(" reserved=").Append(_reservedItems)
-                    .Append(" [");
-
-                for (var i = 0; i < _containers.Count; i++)
-                {
-                    if (i > 0)
-                        sb.Append("; ");
-
-                    sb.Append(_containers[i].Description);
-                }
-
-                sb.Append("]");
-                return sb.ToString();
-            }
-        }
-
-        internal static bool TryCreate(CondOwner hauler, out CarriedContainerPlan plan, out string reason, bool log = true)
-        {
-            plan = null;
-            reason = "other";
-
-            var activeDragContainer = VanillaHaulBatcher.GetDragSlotItem(hauler);
-            var dragSlotOccupied = activeDragContainer != null || (hauler?.HasCond("IsDragging") ?? false);
-            var candidates = FindCarriedContainers(hauler);
-            if (candidates.Count == 0)
-            {
-                reason = "no-carried-container";
-                return false;
-            }
-
-            plan = new CarriedContainerPlan(candidates, dragSlotOccupied, activeDragContainer);
-            reason = "";
-            if (log)
-            {
-                Plugin.ModInfo("[V2CarryContainers] hauler=" + VanillaHaulBatcherSafeCO(hauler)
-                    + " " + plan.Description);
-            }
-
-            return true;
-        }
-
-        internal bool IsActiveDragContainer(CondOwner item)
-        {
-            return item != null
-                && HasActiveDragContainer
-                && !string.IsNullOrEmpty(item.strID)
-                && string.Equals(item.strID, _activeDragContainerID, StringComparison.OrdinalIgnoreCase);
-        }
-
-        internal bool TryAddPlannedContainer(CondOwner item, string source, out string reason)
-        {
-            reason = "other";
-            if (item == null)
-            {
-                reason = "null";
-                return false;
-            }
-
-            if (item.objContainer == null)
-            {
-                reason = "no-container";
-                return false;
-            }
-
-            if (string.IsNullOrEmpty(item.strID))
-            {
-                reason = "no-id";
-                return false;
-            }
-
-            if (_containerIDs.Contains(item.strID))
-            {
-                reason = "already-planned";
-                return false;
-            }
-
-            var container = item.objContainer;
-            if (container.gridLayout == null && !item.HasCond("IsInfiniteContainer"))
-            {
-                reason = "no-grid";
-                return false;
-            }
-
-            _containerIDs.Add(item.strID);
-            _containers.Add(new ContainerState(container, source ?? "planned"));
-            reason = "";
-            return true;
-        }
-
-        internal bool TryReserve(CondOwner item, out string reason)
-        {
-            reason = "other";
-            if (item == null)
-            {
-                reason = "null";
-                return false;
-            }
-
-            var reasons = new List<string>();
-            foreach (var container in _containers)
-            {
-                if (container.TryReserve(item, out var containerReason))
-                {
-                    _reservedItems++;
-                    reason = "";
-                    return true;
-                }
-
-                if (!string.IsNullOrEmpty(containerReason))
-                    reasons.Add(containerReason);
-            }
-
-            reason = ChooseFailureReason(reasons);
-            return false;
-        }
-
-        private static List<ContainerCandidate> FindCarriedContainers(CondOwner hauler)
-        {
-            var candidates = new List<ContainerCandidate>();
-            var seen = new HashSet<string>();
-
-            AddSlotContainers(hauler, candidates, seen);
-            AddContainedContainers(hauler, candidates, seen);
-
-            return candidates;
-        }
-
-        private static void AddSlotContainers(CondOwner hauler, List<ContainerCandidate> candidates, HashSet<string> seen)
+        internal static void MarkState(CondOwner item, string state, string reason)
         {
             try
             {
-                if (hauler?.compSlots == null)
-                    return;
-
-                foreach (var slot in hauler.compSlots.GetSlotsHeldFirst(true))
-                {
-                    var item = slot?.GetOutermostCO();
-                    AddCandidate(item, "slot:" + (slot?.strName ?? "?"), candidates, seen);
-                }
-
-                AddCandidate(VanillaHaulBatcher.GetDragSlotItem(hauler), "slot:drag", candidates, seen);
-            }
-            catch
-            {
-            }
-        }
-
-        private static void AddContainedContainers(CondOwner hauler, List<ContainerCandidate> candidates, HashSet<string> seen)
-        {
-            try
-            {
-                if (hauler == null)
-                    return;
-
-                foreach (var item in hauler.GetCOsSafe(true, null))
-                    AddCandidate(item, "carried", candidates, seen);
-            }
-            catch
-            {
-            }
-        }
-
-        private static void AddCandidate(CondOwner item, string source, List<ContainerCandidate> candidates, HashSet<string> seen)
-        {
-            if (item?.objContainer == null || item.bDestroyed || string.IsNullOrEmpty(item.strID))
-                return;
-
-            if (item.HasCond("IsInstalled"))
-                return;
-
-            var container = item.objContainer;
-            var hasGrid = container.gridLayout != null;
-            if (!hasGrid && !item.HasCond("IsInfiniteContainer"))
-                return;
-
-            if (!seen.Add(item.strID))
-                return;
-
-            candidates.Add(new ContainerCandidate
-            {
-                Owner = item,
-                Source = source,
-                Score = ContainerScore(item, source)
-            });
-        }
-
-        private static int ContainerScore(CondOwner item, string source)
-        {
-            if (item == null)
-                return int.MinValue;
-
-            var score = 1000;
-            source = source ?? "";
-
-            if (source == "slot:back" || item.HasCond("IsBackpack"))
-                score += 5000;
-
-            if (source == "slot:heldL" || source == "slot:heldR" || source == "slot:handL" || source == "slot:handR")
-                score += 4000;
-
-            if (source == "slot:drag")
-                score += 3000;
-
-            var text = ((item.strNameFriendly ?? "") + " " + (item.strName ?? "") + " " + (item.strCODef ?? "")).ToLowerInvariant();
-            if (text.Contains("backpack") || text.Contains("kompart"))
-                score += 2000;
-
-            if (text.Contains("crate") || text.Contains("dolly") || text.Contains("cart"))
-                score += 1000;
-
-            if (item.objContainer?.gridLayout != null)
-                score += Math.Max(0, item.objContainer.gridLayout.gridMaxX * item.objContainer.gridLayout.gridMaxY);
-
-            return score;
-        }
-
-        private static int CompareContainerCandidates(ContainerCandidate a, ContainerCandidate b, string activeDragContainerID)
-        {
-            var aActive = IsCandidate(a, activeDragContainerID);
-            var bActive = IsCandidate(b, activeDragContainerID);
-            if (aActive != bActive)
-                return aActive ? -1 : 1;
-
-            return b.Score.CompareTo(a.Score);
-        }
-
-        private static bool IsCandidate(ContainerCandidate candidate, string itemID)
-        {
-            return candidate?.Owner != null
-                && !string.IsNullOrEmpty(itemID)
-                && !string.IsNullOrEmpty(candidate.Owner.strID)
-                && string.Equals(candidate.Owner.strID, itemID, StringComparison.OrdinalIgnoreCase);
-        }
-
-        private static string ChooseFailureReason(List<string> reasons)
-        {
-            if (reasons == null || reasons.Count == 0)
-                return "no-container-fit";
-
-            if (reasons.Contains("no-grid-room"))
-                return "no-grid-room";
-
-            if (reasons.Contains("too-large"))
-                return "too-large";
-
-            if (reasons.Contains("container-reject"))
-                return "container-reject";
-
-            return reasons[0];
-        }
-
-        private static string StackKey(CondOwner item)
-        {
-            return item.strCODef
-                ?? item.strItemDef
-                ?? item.strName
-                ?? item.strNameFriendly
-                ?? item.strID
-                ?? "";
-        }
-
-        private static Dictionary<string, List<int>> CloneStacks(Dictionary<string, List<int>> source)
-        {
-            var clone = new Dictionary<string, List<int>>();
-            foreach (var kvp in source)
-                clone[kvp.Key] = new List<int>(kvp.Value);
-
-            return clone;
-        }
-
-        private static bool CanPlace(bool[,] grid, int x, int y, int width, int height)
-        {
-            for (var yy = y; yy < y + height; yy++)
-            {
-                for (var xx = x; xx < x + width; xx++)
-                {
-                    if (grid[xx, yy])
-                        return false;
-                }
-            }
-
-            return true;
-        }
-
-        private static void MarkPlaced(bool[,] grid, int x, int y, int width, int height)
-        {
-            for (var yy = y; yy < y + height; yy++)
-            {
-                for (var xx = x; xx < x + width; xx++)
-                    grid[xx, yy] = true;
-            }
-        }
-
-        private static string VanillaHaulBatcherSafeCO(CondOwner co)
-        {
-            if (co == null)
-                return "<null>";
-
-            var name = string.IsNullOrEmpty(co.strNameFriendly) ? co.strName : co.strNameFriendly;
-            return (co.strID ?? "?") + "/" + (name ?? "?");
-        }
-
-        private sealed class ContainerCandidate
-        {
-            internal CondOwner Owner;
-            internal string Source;
-            internal int Score;
-        }
-
-        private sealed class ContainerState
-        {
-            private readonly Container _container;
-            private readonly string _source;
-            private bool[,] _occupied;
-            private Dictionary<string, List<int>> _stackCounts;
-            private readonly int _width;
-            private readonly int _height;
-            private int _reservedItems;
-
-            internal ContainerState(Container container, string source)
-            {
-                _container = container;
-                _source = source ?? "?";
-
-                var grid = container.gridLayout;
-                _width = Math.Max(0, grid?.gridMaxX ?? 0);
-                _height = Math.Max(0, grid?.gridMaxY ?? 0);
-                _occupied = new bool[_width, _height];
-                _stackCounts = new Dictionary<string, List<int>>();
-
-                if (grid?.gridID != null)
-                {
-                    for (var x = 0; x < _width; x++)
-                    {
-                        for (var y = 0; y < _height; y++)
-                        {
-                            _occupied[x, y] = !string.IsNullOrEmpty(grid.gridID[x, y]);
-                        }
-                    }
-                }
-
-                SeedDirectStacks();
-            }
-
-            internal string Description
-            {
-                get
-                {
-                    return _source + ":" + VanillaHaulBatcherSafeCO(_container?.CO)
-                        + " grid=" + _width + "x" + _height
-                        + " freeCells=" + CountFreeCells()
-                        + " reserved=" + _reservedItems;
-                }
-            }
-
-            internal bool TryReserve(CondOwner item, out string reason)
-            {
-                reason = "other";
                 if (item == null)
-                {
-                    reason = "null";
-                    return false;
-                }
+                    return;
 
-                if (_container?.CO == null)
-                {
-                    reason = "no-container";
-                    return false;
-                }
+                BigHaulRecord record;
+                if (!Records.TryGetValue(item.strID, out record))
+                    return;
 
+                record.State = state ?? record.State;
+                if (state != "Pending")
+                    ClearIcon(record, reason ?? state);
+            }
+            catch (Exception ex)
+            {
+                Plugin.Warn("BIG state mark failed: item=" + Plugin.Describe(item) + " state=" + state + " error=" + ex.Message);
+            }
+        }
+
+        internal static bool CancelById(string itemId, string reason)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(itemId))
+                    return false;
+
+                BigHaulRecord record;
+                if (!Records.TryGetValue(itemId, out record) || record == null)
+                    return false;
+
+                if (record.State == "Cancelled")
+                    return false;
+
+                record.State = "Cancelled";
+                ClearIcon(record, reason ?? "cancelled");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Warn("BIG cancel by id failed: itemId=" + itemId + " error=" + ex.Message);
+                return false;
+            }
+        }
+
+        internal static bool IsTracked(CondOwner item)
+        {
+            try
+            {
+                if (item == null || string.IsNullOrEmpty(item.strID))
+                    return false;
+
+                BigHaulRecord record;
+                return Records.TryGetValue(item.strID, out record) && record != null && (record.State == "Pending" || record.State == "PickedUp");
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool IsIconVisible(GameObject icon)
+        {
+            try
+            {
+                var renderer = icon != null ? icon.GetComponent<MeshRenderer>() : null;
+                return renderer != null && renderer.enabled;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool HasCond(CondOwner co, string cond)
+        {
+            try
+            {
+                return co != null && co.HasCond(cond);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static void ClearIcon(BigHaulRecord record, string reason)
+        {
+            if (record == null || record.Icon == null)
+                return;
+
+            try
+            {
+                var sign = record.Icon;
+                var workManager = CrewSim.objInstance?.workManager;
+                if (workManager != null)
+                    sign.transform.SetParent(workManager.transform, false);
+
+                var renderer = sign.GetComponent<MeshRenderer>();
+                if (renderer != null)
+                    renderer.enabled = false;
+
+                record.Icon = null;
+                record.IconAttached = false;
+                Plugin.ModInfo("BIG icon cleared: reason=" + reason + " " + record);
+            }
+            catch (Exception ex)
+            {
+                Plugin.Warn("BIG icon clear failed: reason=" + reason + " " + record + " error=" + ex.Message);
+            }
+        }
+
+        private static string Safe(Func<string> getter)
+        {
+            try
+            {
+                return getter() ?? "<null>";
+            }
+            catch
+            {
+                return "<error>";
+            }
+        }
+    }
+
+    internal sealed class BigHaulRecord
+    {
+        internal string ItemId;
+        internal string ItemName;
+        internal string ItemDef;
+        internal string ShipId;
+        internal string Tile;
+        internal string Mode;
+        internal string State;
+        internal string ClaimedBy;
+        internal string RegisteredBy;
+        internal DateTime RegisteredAt;
+        internal GameObject Icon;
+        internal bool IconAttached;
+
+        public override string ToString()
+        {
+            return "item=" + ItemName
+                + " id=" + ItemId
+                + " def=" + ItemDef
+                + " ship=" + ShipId
+                + " tile=" + Tile
+                + " mode=" + Mode
+                + " state=" + State
+                + " by=" + RegisteredBy
+                + " icon=" + IconAttached
+                + " at=" + RegisteredAt.ToString("HH:mm:ss");
+        }
+    }
+
+    internal static class BigLog
+    {
+        private static readonly object Sync = new object();
+        private static string _path;
+        private static bool _ready;
+
+        internal static void Init(string version)
+        {
+            lock (Sync)
+            {
                 try
                 {
-                    if (_container.ctAllowed != null && !_container.ctAllowed.Triggered(item))
-                    {
-                        reason = "container-reject";
-                        return false;
-                    }
+                    var root = Paths.BepInExRootPath;
+                    var dir = Path.Combine(root, "BIGSupportLogs");
+                    Directory.CreateDirectory(dir);
+                    _path = Path.Combine(dir, "BIG-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".log");
+                    _ready = true;
+                    WriteRaw("=== BIG Better Inventory Game " + version + " started " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " ===");
+                    WriteRaw("Plugin path: " + typeof(Plugin).Assembly.Location);
+                    WriteRaw("");
                 }
                 catch
                 {
-                    reason = "container-test-failed";
-                    return false;
+                    _ready = false;
                 }
+            }
+        }
 
-                if (_container.CO.HasCond("IsInfiniteContainer"))
+        internal static void Write(string level, string message)
+        {
+            lock (Sync)
+            {
+                if (!_ready)
+                    return;
+
+                WriteRaw(DateTime.Now.ToString("HH:mm:ss.fff") + " [" + level + "] " + (message ?? ""));
+            }
+        }
+
+        internal static void Close()
+        {
+            lock (Sync)
+            {
+                if (!_ready)
+                    return;
+
+                WriteRaw("");
+                WriteRaw("=== ended " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " ===");
+                _ready = false;
+            }
+        }
+
+        private static void WriteRaw(string line)
+        {
+            try
+            {
+                File.AppendAllText(_path, line + Environment.NewLine);
+            }
+            catch
+            {
+                // BIG logging must never affect the game.
+            }
+        }
+    }
+
+    [HarmonyPatch(typeof(DataHandler), "Init")]
+    internal static class DataHandlerInitPatch
+    {
+        [HarmonyPostfix]
+        private static void Postfix()
+        {
+            Plugin.InstallCustomInteraction();
+        }
+    }
+
+    [HarmonyPatch(typeof(CondOwner), "CheckInteractionFlag")]
+    internal static class CheckInteractionFlagPatch
+    {
+        [HarmonyPostfix]
+        private static void Postfix(CondOwner __instance)
+        {
+            if (!Plugin.IsDataReady())
+                return;
+
+            Plugin.TryAddInteractionToCandidate(__instance);
+        }
+    }
+
+    [HarmonyPatch(typeof(CondOwner), nameof(CondOwner.QueueInteraction))]
+    internal static class QueueInteractionPatch
+    {
+        [HarmonyPrefix]
+        private static bool Prefix(CondOwner __instance, CondOwner objTarget, Interaction objInteraction, ref bool __result)
+        {
+            if (objInteraction == null || objInteraction.strName != Plugin.BigHaulInteraction)
+                return true;
+
+            try
+            {
+                var accepted = Plugin.TryRegisterLooseItem(__instance, objTarget, out var message);
+                if (accepted)
                 {
-                    _reservedItems++;
-                    reason = "";
-                    return true;
-                }
-
-                var testGrid = (bool[,])_occupied.Clone();
-                var testStacks = CloneStacks(_stackCounts);
-                var remaining = Math.Max(1, item.StackCount);
-                var stackLimit = Math.Max(1, item.nStackLimit);
-
-                if (_container.bAllowStacking && stackLimit > 1)
-                {
-                    var key = StackKey(item);
-                    if (!testStacks.TryGetValue(key, out var counts))
-                    {
-                        counts = new List<int>();
-                        testStacks[key] = counts;
-                    }
-
-                    for (var i = 0; i < counts.Count && remaining > 0; i++)
-                    {
-                        var free = Math.Max(0, stackLimit - counts[i]);
-                        var take = Math.Min(free, remaining);
-                        counts[i] += take;
-                        remaining -= take;
-                    }
-
-                    while (remaining > 0)
-                    {
-                        if (!TryPlaceItemShape(item, testGrid, out reason))
-                            return false;
-
-                        var take = Math.Min(stackLimit, remaining);
-                        counts.Add(take);
-                        remaining -= take;
-                    }
+                    Plugin.ModInfo(message);
+                    BigHaulPlanner.StartLooseSession(__instance, new[] { objTarget });
                 }
                 else
                 {
-                    for (var i = 0; i < remaining; i++)
-                    {
-                        if (!TryPlaceItemShape(item, testGrid, out reason))
-                            return false;
-                    }
+                    Plugin.Warn(message);
                 }
 
-                _occupied = testGrid;
-                _stackCounts = testStacks;
-                _reservedItems++;
-                reason = "";
-                return true;
-            }
-
-            private void SeedDirectStacks()
-            {
-                var owner = _container?.CO;
-                if (owner == null)
-                    return;
-
-                List<CondOwner> contents;
-                try
-                {
-                    contents = owner.GetCOsSafe(true, null);
-                }
-                catch
-                {
-                    return;
-                }
-
-                foreach (var item in contents)
-                {
-                    if (item == null
-                        || item.bDestroyed
-                        || item.coStackHead != null
-                        || item.objCOParent != owner
-                        || item.nStackLimit <= 1)
-                    {
-                        continue;
-                    }
-
-                    var key = StackKey(item);
-                    if (!_stackCounts.TryGetValue(key, out var counts))
-                    {
-                        counts = new List<int>();
-                        _stackCounts[key] = counts;
-                    }
-
-                    counts.Add(Math.Max(1, item.StackCount));
-                }
-            }
-
-            private bool TryPlaceItemShape(CondOwner item, bool[,] grid, out string reason)
-            {
-                reason = "shape";
-                if (item == null || _width <= 0 || _height <= 0)
-                    return false;
-
-                var size = GUIInventoryItem.GetWidthHeightForCO(item);
-                var itemWidth = Math.Max(1, size.x);
-                var itemHeight = Math.Max(1, size.y);
-
-                if (itemWidth > _width || itemHeight > _height)
-                {
-                    reason = "too-large";
-                    return false;
-                }
-
-                for (var y = 0; y <= _height - itemHeight; y++)
-                {
-                    for (var x = 0; x <= _width - itemWidth; x++)
-                    {
-                        if (!CanPlace(grid, x, y, itemWidth, itemHeight))
-                            continue;
-
-                        MarkPlaced(grid, x, y, itemWidth, itemHeight);
-                        reason = "";
-                        return true;
-                    }
-                }
-
-                reason = "no-grid-room";
-                return false;
-            }
-
-            private int CountFreeCells()
-            {
-                var free = 0;
-                for (var x = 0; x < _width; x++)
-                {
-                    for (var y = 0; y < _height; y++)
-                    {
-                        if (!_occupied[x, y])
-                            free++;
-                    }
-                }
-
-                return free;
-            }
-        }
-    }
-
-    [HarmonyPatch(typeof(WorkManager), nameof(WorkManager.CompleteTask), new Type[] { typeof(string), typeof(string), typeof(string) })]
-    internal static class CompleteTaskPatch
-    {
-        private static void Prefix()
-        {
-            HaulBatchRegistry.BeginCompleteTask();
-        }
-
-        private static void Finalizer()
-        {
-            HaulBatchRegistry.EndCompleteTask();
-        }
-    }
-
-    [HarmonyPatch(typeof(WorkManager), nameof(WorkManager.RemoveTask), new Type[] { typeof(Task2) })]
-    internal static class RemoveTaskPatch
-    {
-        private static void Prefix(Task2 task)
-        {
-            try
-            {
-                HaulBatchRegistry.HandleRemovedTask(task);
+                __result = accepted;
             }
             catch (Exception ex)
             {
-                Plugin.ModError("[V2HaulCancelCleanup] failed: " + ex);
+                Plugin.Error("BIG Haul Items registration failed: " + ex);
+                __result = false;
             }
+
+            return false;
         }
     }
 
-    [HarmonyPatch(typeof(CondOwner), "GetWork")]
-    internal static class GetWorkPatch
+    [HarmonyPatch(typeof(CondOwner), nameof(CondOwner.EndTurn))]
+    internal static class CondOwnerEndTurnPatch
     {
+        [HarmonyPostfix]
         private static void Postfix(CondOwner __instance)
         {
+            BigHaulPlanner.TryPump(__instance);
+        }
+    }
+
+    [HarmonyPatch(typeof(CondOwner), nameof(CondOwner.AIIssueOrder))]
+    internal static class CondOwnerAIIssueOrderPatch
+    {
+        [HarmonyPrefix]
+        private static void Prefix(CondOwner __instance, Interaction objInt, bool bPlayerOrdered, Tile til)
+        {
+            if (!bPlayerOrdered)
+                return;
+
+            var order = objInt != null ? objInt.strName : (til != null ? "Walk" : "<unknown>");
+            Plugin.StopBigHaulPainting("player-order:" + order);
+            BigHaulPlanner.PauseSessionForPlayerOrder(__instance, "player-order:" + order, true);
+        }
+    }
+
+    [HarmonyPatch(typeof(GUIPDA), "ShowJobPaintUI")]
+    internal static class GUIPDAShowJobPaintUIPatch
+    {
+        [HarmonyPostfix]
+        private static void Postfix(GUIPDA __instance, string btn)
+        {
+            if (btn == "actions")
+            {
+                Plugin.AddBigHaulPanelButton(__instance);
+                return;
+            }
+
+            var reason = "vanilla-paint-ui:" + (btn ?? "<null>");
+            Plugin.StopBigHaulPainting(reason);
+            BigHaulPlanner.CancelAllForHauler(CrewSim.GetSelectedCrew(), reason, true);
+        }
+    }
+
+    [HarmonyPatch(typeof(CrewSim), nameof(CrewSim.StartPaintingJob))]
+    internal static class CrewSimStartPaintingJobPatch
+    {
+        [HarmonyPrefix]
+        private static void Prefix(CrewSim __instance, JsonInstallable ji)
+        {
             try
             {
-                VanillaHaulBatcher.TryCompact(__instance);
+                if (!Plugin.IsVanillaHaulPaintJob(ji))
+                    return;
+
+                var hauler = CrewSim.GetSelectedCrew();
+                Plugin.StopBigHaulPainting("vanilla-haul-start");
+                BigHaulPlanner.CancelAllForHauler(hauler, "vanilla-haul-start", true);
+                Plugin.ModInfo("[BIGVanillaHaulStart] hauler=" + Plugin.SafeName(hauler)
+                    + " job=" + Plugin.InstallableSummary(ji) + ".");
             }
             catch (Exception ex)
             {
-                Plugin.ModError("[V2HaulBatch] failed: " + ex);
+                Plugin.Warn("[BIGVanillaHaulStart] failed: " + ex.Message);
+            }
+        }
+    }
+
+    [HarmonyPatch(typeof(CrewSim), nameof(CrewSim.FinishPaintingJob))]
+    internal static class FinishPaintingJobPatch
+    {
+        [HarmonyPostfix]
+        private static void Postfix()
+        {
+            Plugin.StopBigHaulPainting();
+        }
+    }
+
+    [HarmonyPatch(typeof(CrewSim), "PaintBounds")]
+    internal static class CrewSimPaintBoundsPatch
+    {
+        [HarmonyPrefix]
+        private static void Prefix(CrewSim __instance, Bounds bnd)
+        {
+            try
+            {
+                if (!Plugin.IsVanillaCancelPaintJob(__instance))
+                    return;
+
+                var hauler = CrewSim.GetSelectedCrew();
+                var cancelled = Plugin.CancelBigItemsInBounds(hauler, bnd, "vanilla-cancel-bounds");
+                Plugin.ModInfo("[BIGCancelPaintBounds] job=" + Plugin.InstallableSummary(CrewSim.jiLast) + " cancelled=" + cancelled + ".");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Warn("[BIGCancelPaintBounds] failed: " + ex.Message);
+            }
+        }
+    }
+
+    [HarmonyPatch(typeof(WorkManager), nameof(WorkManager.RemoveTask), new Type[] { typeof(string) })]
+    internal static class WorkManagerRemoveTaskByCOIDPatch
+    {
+        [HarmonyPostfix]
+        private static void Postfix(string strCOID)
+        {
+            try
+            {
+                if (BigHaulPlanner.CancelPendingItemById(strCOID, "vanilla-cancel-task"))
+                {
+                    Plugin.Warn("[BIGCancelHook] removed BIG task for coId=" + strCOID + ".");
+                    Plugin.TryCancelBigItemsFromCurrentVanillaSelection("vanilla-cancel-selection");
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Warn("[BIGCancelHook] failed: coId=" + strCOID + " error=" + ex.Message);
             }
         }
     }
